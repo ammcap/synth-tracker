@@ -23,10 +23,10 @@ const DATA_API_URL = 'https://data-api.polymarket.com';
 const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
 
 // Topics
-const ORDER_FILLED_TOPIC = ethers.keccak256(ethers.toUtf8Bytes(
+const ORDER_FILLED_TOPIC = ethers.utils.keccak256(ethers.utils.toUtf8Bytes(
   'OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)'
 ));
-const PAYOUT_REDEMPTION_TOPIC = ethers.keccak256(ethers.toUtf8Bytes(
+const PAYOUT_REDEMPTION_TOPIC = ethers.utils.keccak256(ethers.utils.toUtf8Bytes(
   'PayoutRedemption(address,address,bytes32,bytes32,uint256[],uint256)'
 ));
 
@@ -143,7 +143,7 @@ async function handleTradeLog(log) {
   if (log.address.toLowerCase() !== EXCHANGE_CONTRACT) return;
   if (log.topics[0] !== ORDER_FILLED_TOPIC) return;
 
-  const iface = new ethers.Interface([`event OrderFilled(
+  const iface = new ethers.utils.Interface([`event OrderFilled(
     bytes32 indexed orderHash,
     address indexed maker,
     address indexed taker,
@@ -164,14 +164,14 @@ async function handleTradeLog(log) {
   const takerAssetId = decoded.args.takerAssetId;
 
   const isBuy = isSynthMaker 
-    ? (makerAssetId === 0n) 
-    : (takerAssetId === 0n);
+    ? (makerAssetId.eq(0)) 
+    : (takerAssetId.eq(0));
   const side = isBuy ? 'BUY' : 'SELL';
 
-  const outcomeTokenId = (makerAssetId === 0n) ? takerAssetId : makerAssetId;
-  const usdcAmount = (makerAssetId === 0n) ? decoded.args.makerAmountFilled : decoded.args.takerAmountFilled;
-  const tokenAmount = (makerAssetId === 0n) ? decoded.args.takerAmountFilled : decoded.args.makerAmountFilled;
-  const price = Number(usdcAmount) / Number(tokenAmount);
+  const outcomeTokenId = (makerAssetId.eq(0)) ? takerAssetId : makerAssetId;
+  const usdcAmount = (makerAssetId.eq(0)) ? decoded.args.makerAmountFilled : decoded.args.takerAmountFilled;
+  const tokenAmount = (makerAssetId.eq(0)) ? decoded.args.takerAmountFilled : decoded.args.makerAmountFilled;
+  const price = usdcAmount.toNumber() / tokenAmount.toNumber();
 
   const { market, outcome } = await resolveTokenId(outcomeTokenId);
 
@@ -180,8 +180,8 @@ async function handleTradeLog(log) {
     side,
     market,
     outcome,
-    shares: parseFloat(ethers.formatUnits(tokenAmount, 6)).toFixed(2),
-    usdc: parseFloat(ethers.formatUnits(usdcAmount, 6)).toFixed(2),
+    shares: parseFloat(ethers.utils.formatUnits(tokenAmount, 6)).toFixed(2),
+    usdc: parseFloat(ethers.utils.formatUnits(usdcAmount, 6)).toFixed(2),
     price: price.toFixed(4),
     tx: log.transactionHash
   };
@@ -194,7 +194,7 @@ async function handleRedeemLog(log) {
   if (log.address.toLowerCase() !== CTF_CONTRACT) return;
   if (log.topics[0] !== PAYOUT_REDEMPTION_TOPIC) return;
 
-  const iface = new ethers.Interface([`event PayoutRedemption(
+  const iface = new ethers.utils.Interface([`event PayoutRedemption(
     address indexed redeemer,
     address indexed collateralToken,
     bytes32 indexed parentCollectionId,
@@ -213,11 +213,11 @@ async function handleRedeemLog(log) {
 
   const marketData = await resolveConditionId(conditionId);
   const market = marketData ? marketData.question : 'Unknown';
-  // Assume binary market; indexSets[0] == 1n for 'Yes' (index 0), 2 for 'No' (index 1)
-  const outcomeIndex = indexSets[0] === 1n ? 0 : 1;
+  // Assume binary market; indexSets[0] == 1 for 'Yes' (index 0), 2 for 'No' (index 1)
+  const outcomeIndex = indexSets[0].eq(1) ? 0 : 1;
   const outcomes = JSON.parse(marketData?.outcomes || '[]');
   const outcome = outcomes[outcomeIndex] || 'Unknown';
-  const shares = parseFloat(ethers.formatUnits(payout, 6)).toFixed(2);
+  const shares = parseFloat(ethers.utils.formatUnits(payout, 6)).toFixed(2);
 
   const trade = {
     time: new Date().toISOString().split('T')[1].split('.')[0],
@@ -225,7 +225,7 @@ async function handleRedeemLog(log) {
     market,
     outcome,
     shares,
-    usdc: parseFloat(ethers.formatUnits(payout, 6)).toFixed(2),
+    usdc: parseFloat(ethers.utils.formatUnits(payout, 6)).toFixed(2),
     price: '1.0000',  // Resolved winner redeems at $1
     tx: log.transactionHash
   };
@@ -267,30 +267,30 @@ function printRecentActivity() {
 
 // Start tracker
 function startTracker() {
-  const provider = new ethers.WebSocketProvider(POLYGON_WS_URL);
+  const provider = new ethers.providers.WebSocketProvider(POLYGON_WS_URL);
 
-  provider.websocket.on('open', () => {
+  provider._websocket.on('open', () => {
     console.log(colors.green + 'Connected to Polygon websocket' + colors.reset);
     fetchPositions(true);  // Initial print
     setInterval(printRecentActivity, 60000);
   });
 
   // Trade filter
-  const tradeFilter = { address: EXCHANGE_CONTRACT, topics: [[ORDER_FILLED_TOPIC]] };
+  const tradeFilter = { address: EXCHANGE_CONTRACT, topics: [ORDER_FILLED_TOPIC] };
   provider.on(tradeFilter, handleTradeLog);
 
   // Redeem filter (filter by redeemer topic)
-  const redeemTopics = [[PAYOUT_REDEMPTION_TOPIC, ethers.zeroPadValue(SYNTH_ADDRESS, 32)]];
+  const redeemTopics = [PAYOUT_REDEMPTION_TOPIC, ethers.utils.hexZeroPad(SYNTH_ADDRESS, 32)];
   const redeemFilter = { address: CTF_CONTRACT, topics: redeemTopics };
   provider.on(redeemFilter, handleRedeemLog);
 
-  provider.websocket.on('close', () => {
+  provider._websocket.on('close', () => {
     console.log(colors.yellow + 'WebSocket closed. Reconnecting...' + colors.reset);
     setTimeout(startTracker, 1000);
   });
 
   provider.on('error', err => console.error(colors.red + 'Provider Error:' + colors.reset, err));
-  provider.websocket.on('error', err => console.error(colors.red + 'WebSocket Error:' + colors.reset, err));
+  provider._websocket.on('error', err => console.error(colors.red + 'WebSocket Error:' + colors.reset, err));
 
   return provider;
 }
