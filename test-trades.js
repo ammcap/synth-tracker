@@ -13,9 +13,9 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS || '';  // If empty, defaults to signer.address
 const POLYGON_RPC_URL = process.env.POLYGON_RPC_URL;
 const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';  // ConditionalTokens contract
-const MARKET_SLUG = 'btc-updown-4h-1763485200';  // Update to a current active market (e.g., from polymarket.com)
+const MARKET_SLUG = 'btc-updown-4h-1763485200';  // Example for Nov 19, 12PM-4PM ET; update to a current active market from polymarket.com
 const OUTCOME = 'Up';  // Adjust based on actual outcomes (e.g., 'Yes' for binary markets)
-const AMOUNT_USDC = 6.0;  // $6 test trade; matches min order size
+const AMOUNT_USDC = 5.0;  // $6 test trade; matches min order size
 const SIGNATURE_TYPE = 2;  // 2 for smart contract wallets (EIP-1271)
 
 
@@ -84,27 +84,25 @@ async function main() {
   const tickSize = market.orderPriceMinTickSize || '0.01';  // Use correct field; fallback to common min
   const negRisk = market.negRisk === true || market.negRisk === 'true';  // Boolean
 
-  // Derive or create API key using signer (uncomment to run once, then copy to .env and re-comment)
-  let newCreds;
-  try {
-    console.log('Deriving/creating API key with signer...');
-    const tempClobClient = new ClobClient(CLOB_HOST, CHAIN_ID, signer, null, SIGNATURE_TYPE, FUNDER_ADDRESS);
-    newCreds = await tempClobClient.deriveApiKey();  // Derives existing or creates new
-    console.log('New API creds (copy to .env):');
-    console.log(`API_KEY=${newCreds.key}`);
-    console.log(`API_SECRET=${newCreds.secret}`);
-    console.log(`API_PASSPHRASE=${newCreds.passphrase}`);
-  } catch (error) {
-    console.error('Error deriving/creating API key:', error.message, error.response?.data);
+  // Load creds from env
+  const API_KEY = process.env.API_KEY;
+  const API_SECRET = process.env.API_SECRET;
+  const API_PASSPHRASE = process.env.API_PASSPHRASE;
+
+  if (!API_KEY || !API_SECRET || !API_PASSPHRASE) {
+    console.error('Missing env vars: API_KEY, API_SECRET, and API_PASSPHRASE required for creds.');
     return;
   }
 
-  // Use the new creds for this run
-  const creds = newCreds;
+  const creds = {
+    key: API_KEY,
+    secret: API_SECRET,
+    passphrase: API_PASSPHRASE
+  };
 
   // Initialize ClobClient with creds
   const clobClient = new ClobClient(CLOB_HOST, CHAIN_ID, signer, creds, SIGNATURE_TYPE, FUNDER_ADDRESS);
-  console.log('Initialized ClobClient with new creds.');
+  console.log('Initialized ClobClient with creds.');
 
   // Place market buy for $AMOUNT_USDC (FOK with price=0.99 to simulate market buy)
   // First, get best ask to calculate approximate size (shares = USDC / best_ask)
