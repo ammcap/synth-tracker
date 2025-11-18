@@ -7,6 +7,7 @@ const EXCHANGE_CONTRACT = '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e'.toLowerCa
 const CTF_CONTRACT = '0x4d97dcd97ec945f40cf65f87097ace5ea0476045'.toLowerCase();
 const POLYGON_WS_URL = 'wss://polygon-mainnet.g.alchemy.com/v2/PLG7HaKwMvU9g5Ajifosm';  // Keep your key here
 const DATA_API_URL = 'https://data-api.polymarket.com';
+const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
 
 // Topics
 const ORDER_FILLED_TOPIC = ethers.keccak256(ethers.toUtf8Bytes(
@@ -20,6 +21,11 @@ const PAYOUT_REDEMPTION_TOPIC = ethers.keccak256(ethers.toUtf8Bytes(
 let currentPositions = [];
 let recentTrades = [];  // Includes trades and redeems; last 20
 const MAX_TRADES = 20;
+
+// Function to sleep
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 // Fetch positions
 async function fetchPositions(print = false) {
@@ -58,35 +64,57 @@ async function fetchPositions(print = false) {
 
 // Resolve tokenId → market/outcome
 async function resolveTokenId(tokenId) {
-  try {
-    const response = await axios.get(`${DATA_API_URL}/markets`, {
-      params: { token_ids: tokenId.toString(), limit: 1 }
-    });
-    if (response.data.length > 0) {
-      const market = response.data[0];
-      return { market: market.question, outcome: market.outcomes.find(o => o.tokenId === tokenId.toString())?.name || 'Unknown' };
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const response = await axios.get(`${GAMMA_API_URL}/markets`, {
+        params: { clob_token_ids: tokenId.toString(), limit: 1 }
+      });
+      if (response.data.length > 0) {
+        const market = response.data[0];
+        const tokenIds = (market.clobTokenIds || '').split(',');
+        const index = tokenIds.indexOf(tokenId.toString());
+        const outcomes = (market.outcomes || '').split(',');
+        const outcome = (index !== -1) ? outcomes[index] || 'Unknown' : 'Unknown';
+        return { market: market.question || 'Unknown', outcome };
+      }
+      return { market: 'Unknown', outcome: 'Unknown' };
+    } catch (error) {
+      if (error.response && error.response.status === 404) {
+        console.log(`TokenId resolution attempt ${attempt + 1} failed (404) - retrying in 3s...`);
+        await sleep(3000);
+      } else {
+        console.log('Error resolving tokenId (fallback to Unknown):', error.message);
+        return { market: 'Unknown', outcome: 'Unknown' };
+      }
     }
-    return { market: 'Unknown', outcome: 'Unknown' };
-  } catch (error) {
-    console.log('Error resolving tokenId (fallback to Unknown):', error.message);
-    return { market: 'Unknown', outcome: 'Unknown' };
   }
+  console.log('Failed to resolve tokenId after retries (fallback to Unknown)');
+  return { market: 'Unknown', outcome: 'Unknown' };
 }
 
 // Resolve conditionId → market (for redeems; outcomes from indexSets)
 async function resolveConditionId(conditionId) {
-  try {
-    const response = await axios.get(`${DATA_API_URL}/markets`, {
-      params: { condition_id: conditionId, limit: 1 }
-    });
-    if (response.data.length > 0) {
-      return response.data[0];  // Returns full market with outcomes
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const response = await axios.get(`${GAMMA_API_URL}/markets`, {
+        params: { condition_ids: conditionId, limit: 1 }
+      });
+      if (response.data.length > 0) {
+        return response.data[0];  // Returns full market with outcomes
+      }
+      return null;
+    } catch (error) {
+      if (error.response && error.response.status === 404) {
+        console.log(`ConditionId resolution attempt ${attempt + 1} failed (404) - retrying in 3s...`);
+        await sleep(3000);
+      } else {
+        console.log('Error resolving conditionId (fallback to Unknown):', error.message);
+        return null;
+      }
     }
-    return null;
-  } catch (error) {
-    console.log('Error resolving conditionId (fallback to Unknown):', error.message);
-    return null;
   }
+  console.log('Failed to resolve conditionId after retries (fallback to Unknown)');
+  return null;
 }
 
 // Handle trade log
@@ -166,7 +194,8 @@ async function handleRedeemLog(log) {
   const market = marketData ? marketData.question : 'Unknown';
   // Assume binary market; indexSets[0] == 1n for 'Yes' (index 0), 2 for 'No' (index 1)
   const outcomeIndex = indexSets[0] === 1n ? 0 : 1;
-  const outcome = marketData ? marketData.outcomes[outcomeIndex]?.name || 'Unknown' : 'Unknown';
+  const outcomes = (marketData?.outcomes || '').split(',');
+  const outcome = outcomes[outcomeIndex] || 'Unknown';
   const shares = Number(payout);  // For resolved binary, payout == shares redeemed (since 1 share = 1 USDC on winner)
 
   const trade = {
