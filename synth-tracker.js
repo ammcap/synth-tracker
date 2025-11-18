@@ -71,9 +71,9 @@ async function resolveTokenId(tokenId) {
       });
       if (response.data.length > 0) {
         const market = response.data[0];
-        const tokenIds = (market.clobTokenIds || '').split(',');
+        const tokenIds = JSON.parse(market.clobTokenIds || '[]');
         const index = tokenIds.indexOf(tokenId.toString());
-        const outcomes = (market.outcomes || '').split(',');
+        const outcomes = JSON.parse(market.outcomes || '[]');
         const outcome = (index !== -1) ? outcomes[index] || 'Unknown' : 'Unknown';
         return { market: market.question || 'Unknown', outcome };
       }
@@ -194,7 +194,7 @@ async function handleRedeemLog(log) {
   const market = marketData ? marketData.question : 'Unknown';
   // Assume binary market; indexSets[0] == 1n for 'Yes' (index 0), 2 for 'No' (index 1)
   const outcomeIndex = indexSets[0] === 1n ? 0 : 1;
-  const outcomes = (marketData?.outcomes || '').split(',');
+  const outcomes = JSON.parse(marketData?.outcomes || '[]');
   const outcome = outcomes[outcomeIndex] || 'Unknown';
   const shares = Number(payout);  // For resolved binary, payout == shares redeemed (since 1 share = 1 USDC on winner)
 
