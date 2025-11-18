@@ -13,11 +13,10 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS || '';  // If empty, defaults to signer.address
 const POLYGON_RPC_URL = process.env.POLYGON_RPC_URL;
 const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';  // ConditionalTokens contract
-const MARKET_SLUG = 'btc-updown-4h-1763485200';  // Example for Nov 19, 12PM-4PM ET; update to a current active market from polymarket.com
+const MARKET_SLUG = 'btc-updown-15m-1763502300';  // Example for Nov 19, 12PM-4PM ET; update to a current active market from polymarket.com
 const OUTCOME = 'Up';  // Adjust based on actual outcomes (e.g., 'Yes' for binary markets)
-const AMOUNT_USDC = 5.0;  // $6 test trade; matches min order size
+const AMOUNT_USDC = 0.5;  // Sub-$1 test trade
 const SIGNATURE_TYPE = 2;  // 2 for smart contract wallets (EIP-1271)
-
 
 // ERC1155 balanceOf ABI
 const CTF_ABI = [
@@ -104,8 +103,7 @@ async function main() {
   const clobClient = new ClobClient(CLOB_HOST, CHAIN_ID, signer, creds, SIGNATURE_TYPE, FUNDER_ADDRESS);
   console.log('Initialized ClobClient with creds.');
 
-  // Place market buy for $AMOUNT_USDC (FOK with price=0.99 to simulate market buy)
-  // First, get best ask to calculate approximate size (shares = USDC / best_ask)
+  // Get best ask to calculate approximate size (shares = USDC / best_ask)
   let bestAsk;
   try {
     const priceUrl = `${CLOB_HOST}/price?token_id=${tokenId}&side=sell`;
@@ -117,7 +115,7 @@ async function main() {
   }
 
   if (isNaN(bestAsk) || bestAsk <= 0) {
-    console.log('No valid sell orders available for market buy.');
+    console.log('No valid sell orders available.');
     return;
   }
 
@@ -151,11 +149,18 @@ async function main() {
     console.log(`Adjusted buySize for precision: ${buySize.toFixed(4)}`);
   }
 
-  console.log(`Placing $${AMOUNT_USDC} market buy for ~${buySize.toFixed(4)} shares of ${OUTCOME} (based on best ask $${bestAsk.toFixed(4)})...`);
+  // For passive limit buy: Set price just below bestAsk to avoid crossing (non-marketable)
+  const passivePrice = bestAsk - parseFloat(tickSize);  // Subtract tickSize for passive; adjust epsilon if needed
+  if (passivePrice <= 0) {
+    console.error('Passive price would be non-positive; adjust market or epsilon.');
+    return;
+  }
+
+  console.log(`Placing $${AMOUNT_USDC} passive limit buy for ~${buySize.toFixed(4)} shares of ${OUTCOME} at $${passivePrice.toFixed(4)} (below best ask $${bestAsk.toFixed(4)})...`);
 
   const buyParams = {
     tokenID: tokenId,
-    price: price,  // Max valid price for market buy (clamped to 0.99)
+    price: passivePrice,  // Passive price < bestAsk
     side: Side.BUY,
     size: buySize,
   };
@@ -163,9 +168,10 @@ async function main() {
 
   let buyResponse;
   try {
-    buyResponse = await clobClient.createAndPostOrder(buyParams, marketParams, OrderType.FOK);
-    console.log('Buy trade response:');
+    buyResponse = await clobClient.createAndPostOrder(buyParams, marketParams, OrderType.GTC);  // Changed to GTC
+    console.log('Buy order response:');
     console.log(buyResponse);
+    console.log('Order placed successfully! It will rest until filled or canceled. Check status via clobClient.getOrder(buyResponse.orderID)');
   } catch (error) {
     console.error('Error placing buy:', error.message);
     return;
@@ -173,7 +179,7 @@ async function main() {
 
   // Check if buy was successful (use success and status from response)
   if (!buyResponse.success || buyResponse.status !== 'matched') {
-    console.log('Buy likely failed; skipping sell.');
+    console.log('Buy likely not immediately filled; skipping sell for this test. Monitor for fills.');
     return;
   }
 
@@ -224,19 +230,37 @@ async function main() {
   console.log('Waiting additional 50 seconds before selling...');
   await sleep(50000);
 
-  // Place market sell for exact shares (FOK with price=0.01 to simulate market sell)
-  console.log(`Placing market sell for ${sharesToSell.toFixed(6)} shares of ${OUTCOME}...`);
+  // For passive limit sell: Get best bid and set price just above it
+  let bestBid;
+  try {
+    const priceUrl = `${CLOB_HOST}/price?token_id=${tokenId}&side=buy`;
+    const resp = await axios.get(priceUrl);
+    bestBid = parseFloat(resp.data.price);
+  } catch (error) {
+    console.error('Error fetching best bid:', error.message);
+    return;
+  }
+
+  if (isNaN(bestBid) || bestBid <= 0) {
+    console.log('No valid buy orders available for sell.');
+    return;
+  }
+
+  const passiveSellPrice = bestBid + parseFloat(tickSize);  // Add tickSize for passive sell > bestBid
+
+  console.log(`Placing passive limit sell for ${sharesToSell.toFixed(6)} shares of ${OUTCOME} at $${passiveSellPrice.toFixed(4)} (above best bid $${bestBid.toFixed(4)})...`);
+
   const sellParams = {
     tokenID: tokenId,
-    price: sellPrice,  // Min valid price for market sell (clamped to 0.01)
+    price: passiveSellPrice,  // Passive price > bestBid
     side: Side.SELL,
     size: sharesToSell,
   };
 
   let sellResponse;
   try {
-    sellResponse = await clobClient.createAndPostOrder(sellParams, marketParams, OrderType.FOK);
-    console.log('Sell trade response:');
+    sellResponse = await clobClient.createAndPostOrder(sellParams, marketParams, OrderType.GTC);  // Changed to GTC
+    console.log('Sell order response:');
     console.log(sellResponse);
   } catch (error) {
     console.error('Error placing sell:', error.message);
