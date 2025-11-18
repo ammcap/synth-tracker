@@ -1,6 +1,19 @@
 const { ethers } = require('ethers');
 const axios = require('axios');
 
+// ANSI colors for terminal
+const colors = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  green: '\x1b[32m',
+  red: '\x1b[31m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  cyan: '\x1b[36m',
+  magenta: '\x1b[35m',
+  gray: '\x1b[90m'
+};
+
 // Config
 const SYNTH_ADDRESS = '0x557bed924a1bb6f62842c5742d1dc789b8d480d4'.toLowerCase();
 const EXCHANGE_CONTRACT = '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e'.toLowerCase();
@@ -50,15 +63,23 @@ async function fetchPositions(print = false) {
           value: value.toFixed(2),
           avgPrice: avg.toFixed(2),
           currentPrice: currentPrice.toFixed(2),
-          pnl: pnl.toFixed(2) + '%'
+          pnl: pnl.toFixed(2) + '%',
+          pnlNum: pnl
         };
       }).sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
 
-      console.log('\n=== CURRENT POSITIONS (sorted by value) ===');
-      console.table(mapped);
+      console.log(colors.bold + colors.blue + '\n=== CURRENT POSITIONS (sorted by value) ===' + colors.reset);
+      mapped.forEach((p, index) => {
+        const pnlColor = p.pnlNum > 0 ? colors.green : p.pnlNum < 0 ? colors.red : colors.gray;
+        console.log(colors.cyan + `Position ${index + 1}:` + colors.reset + ` ${p.market} (${p.outcome})`);
+        console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg Price:${colors.reset} $${p.avgPrice}`);
+        console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice} | ${colors.magenta}PnL:${colors.reset} ${pnlColor}${p.pnl}${colors.reset}`);
+        console.log(colors.gray + '─'.repeat(80) + colors.reset);
+      });
+      console.log(colors.bold + colors.blue + '--- End of Positions ---' + colors.reset + '\n');
     }
   } catch (error) {
-    console.error('Error fetching positions:', error.message);
+    console.error(colors.red + 'Error fetching positions:' + colors.reset, error.message);
   }
 }
 
@@ -162,7 +183,7 @@ async function handleTradeLog(log) {
     shares: parseFloat(ethers.formatUnits(tokenAmount, 6)).toFixed(2),
     usdc: parseFloat(ethers.formatUnits(usdcAmount, 6)).toFixed(2),
     price: price.toFixed(4),
-    tx: log.transactionHash.slice(0, 10) + '...'
+    tx: log.transactionHash
   };
 
   addToRecentTrades(trade);
@@ -196,17 +217,17 @@ async function handleRedeemLog(log) {
   const outcomeIndex = indexSets[0] === 1n ? 0 : 1;
   const outcomes = JSON.parse(marketData?.outcomes || '[]');
   const outcome = outcomes[outcomeIndex] || 'Unknown';
-  const shares = Number(payout);  // For resolved binary, payout == shares redeemed (since 1 share = 1 USDC on winner)
+  const shares = parseFloat(ethers.formatUnits(payout, 6)).toFixed(2);
 
   const trade = {
     time: new Date().toISOString().split('T')[1].split('.')[0],
     side: 'REDEEM',
     market,
     outcome,
-    shares: shares.toFixed(2),
+    shares,
     usdc: parseFloat(ethers.formatUnits(payout, 6)).toFixed(2),
     price: '1.0000',  // Resolved winner redeems at $1
-    tx: log.transactionHash.slice(0, 10) + '...'
+    tx: log.transactionHash
   };
 
   addToRecentTrades(trade);
@@ -217,8 +238,13 @@ function addToRecentTrades(trade) {
   recentTrades.unshift(trade);
   if (recentTrades.length > MAX_TRADES) recentTrades.pop();
 
-  console.log('\n🚨 NEW ACTIVITY DETECTED!');
-  console.table([trade]);
+  const sideColor = trade.side === 'BUY' ? colors.green : trade.side === 'SELL' ? colors.red : colors.yellow;
+  console.log(colors.bold + colors.yellow + '\n🚨 NEW ACTIVITY DETECTED!' + colors.reset);
+  console.log(`${colors.cyan}Time:${colors.reset} ${trade.time} | ${colors.cyan}Side:${colors.reset} ${sideColor}${trade.side}${colors.reset} | ${colors.cyan}Outcome:${colors.reset} ${trade.outcome}`);
+  console.log(`${colors.cyan}Market:${colors.reset} ${trade.market}`);
+  console.log(`${colors.cyan}Shares:${colors.reset} ${trade.shares} | ${colors.cyan}USDC:${colors.reset} $${trade.usdc} | ${colors.cyan}Price:${colors.reset} $${trade.price}`);
+  console.log(`${colors.cyan}Tx:${colors.reset} https://polygonscan.com/tx/${trade.tx.slice(0, 10) + '...'}`);
+  console.log(colors.gray + '─'.repeat(80) + colors.reset);
 
   // Silent refresh positions
   fetchPositions();
@@ -227,8 +253,16 @@ function addToRecentTrades(trade) {
 // Print recent activity
 function printRecentActivity() {
   if (recentTrades.length === 0) return;
-  console.log('\n=== RECENT ACTIVITY (last', recentTrades.length, ') ===');
-  console.table(recentTrades);
+  console.log(colors.bold + colors.blue + '\n=== RECENT ACTIVITY (last ' + recentTrades.length + ') ===' + colors.reset);
+  recentTrades.forEach((t, index) => {
+    const sideColor = t.side === 'BUY' ? colors.green : t.side === 'SELL' ? colors.red : colors.yellow;
+    console.log(colors.magenta + `Activity ${index + 1}:` + colors.reset + ` ${t.market} (${t.outcome})`);
+    console.log(`Time: ${t.time} | Side: ${sideColor}${t.side}${colors.reset} | Shares: ${t.shares}`);
+    console.log(`USDC: $${t.usdc} | Price: $${t.price}`);
+    console.log(`Tx: https://polygonscan.com/tx/${t.tx.slice(0, 10) + '...'}`);
+    console.log(colors.gray + '─'.repeat(80) + colors.reset);
+  });
+  console.log(colors.bold + colors.blue + '--- End of Recent Activity ---' + colors.reset + '\n');
 }
 
 // Start tracker
@@ -236,7 +270,7 @@ function startTracker() {
   const provider = new ethers.WebSocketProvider(POLYGON_WS_URL);
 
   provider.websocket.on('open', () => {
-    console.log('Connected to Polygon websocket');
+    console.log(colors.green + 'Connected to Polygon websocket' + colors.reset);
     fetchPositions(true);  // Initial print
     setInterval(printRecentActivity, 60000);
   });
@@ -251,15 +285,15 @@ function startTracker() {
   provider.on(redeemFilter, handleRedeemLog);
 
   provider.websocket.on('close', () => {
-    console.log('WebSocket closed. Reconnecting...');
+    console.log(colors.yellow + 'WebSocket closed. Reconnecting...' + colors.reset);
     setTimeout(startTracker, 1000);
   });
 
-  provider.on('error', err => console.error('Provider Error:', err));
-  provider.websocket.on('error', err => console.error('WebSocket Error:', err));
+  provider.on('error', err => console.error(colors.red + 'Provider Error:' + colors.reset, err));
+  provider.websocket.on('error', err => console.error(colors.red + 'WebSocket Error:' + colors.reset, err));
 
   return provider;
 }
 
 startTracker();
-console.log('Synth Tracker Bot Running... Monitoring address:', SYNTH_ADDRESS);
+console.log(colors.bold + 'Synth Tracker Bot Running... Monitoring address:' + colors.reset, SYNTH_ADDRESS);
