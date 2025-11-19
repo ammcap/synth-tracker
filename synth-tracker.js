@@ -18,7 +18,6 @@ const colors = {
 const SYNTH_ADDRESS = '0x557bed924a1bb6f62842c5742d1dc789b8d480d4'.toLowerCase();
 const USER_ADDRESS = '0x2ddc093099a5722dc017c70e756dd3ea5586951e'.toLowerCase();  // Your wallet address
 const EXCHANGE_CONTRACT = '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e'.toLowerCase();
-const CTF_CONTRACT = '0x4d97dcd97ec945f40cf65f87097ace5ea0476045'.toLowerCase();
 const USDC_ADDRESS = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'.toLowerCase();  // USDC contract on Polygon
 const POLYGON_WS_URL = 'wss://polygon-mainnet.g.alchemy.com/v2/PLG7HaKwMvU9g5Ajifosm';  // Keep your key here
 const DATA_API_URL = 'https://data-api.polymarket.com';
@@ -39,26 +38,25 @@ const USDC_ABI = [
 const ORDER_FILLED_TOPIC = ethers.utils.keccak256(ethers.utils.toUtf8Bytes(
   'OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)'
 ));
-const PAYOUT_REDEMPTION_TOPIC = ethers.utils.keccak256(ethers.utils.toUtf8Bytes(
-  'PayoutRedemption(address,address,bytes32,bytes32,uint256[],uint256)'
-));
 
 // In-memory state
 let currentPositions = [];  // Synth's positions
-let userPositions = [];     // New: Your positions
-let recentTrades = [];      // Includes trades and redeems; last 5
-const MAX_TRADES = 5;
+let userPositions = [];     // User's positions
 
 // Global provider
 let provider;
 
-// Global ratio (for dynamic use)
-let currentRatio = 0;
-
-// Global values for recommendations
+// Global values
 let synthPositionsValue = 0;
 let userPositionsValue = 0;
 let userCollateral = 0;
+let synthCollateral = 0;
+
+// Set of known markets Synth has traded in (to detect new ones)
+let knownSynthMarkets = new Set();
+
+// Refresh timeout for debouncing
+let refreshTimeout;
 
 // Function to sleep
 function sleep(ms) {
@@ -90,164 +88,42 @@ async function getCollateral(address) {
   }
 }
 
-// New: Function to refresh and log ratio dynamically
-async function refreshRatio() {
-  console.log(colors.green + 'Refreshing balances...' + colors.reset);
+// Function to refresh and log totals dynamically
+async function refreshTotals() {
   await fetchPositions();
   await fetchUserPositions();
-  const synthCollateral = await getCollateral(SYNTH_ADDRESS);
-  const synthTotal = synthPositionsValue + synthCollateral;
+  synthCollateral = await getCollateral(SYNTH_ADDRESS);
   userCollateral = await getCollateral(USER_ADDRESS);
-  const userTotal = userPositionsValue + userCollateral;
-  const newRatio = synthPositionsValue > 0 ? userTotal / synthPositionsValue : 0;
-
-  // Log only if significant change
-  if (Math.abs(newRatio - currentRatio) > 0.001) {
-    console.log(`${colors.cyan}Synth Positions: $${synthPositionsValue.toFixed(2)} | Collateral: $${synthCollateral.toFixed(2)} | Total: $${synthTotal.toFixed(2)}${colors.reset}`);
-    console.log(`${colors.cyan}User Positions: $${userPositionsValue.toFixed(2)} | Collateral: $${userCollateral.toFixed(2)} | Total: $${userTotal.toFixed(2)}${colors.reset}`);
-    console.log(colors.bold + `Updated Copy Ratio: ${newRatio.toFixed(4)}` + colors.reset);
-    currentRatio = newRatio;
-  } else {
-    console.log(colors.gray + 'Ratio unchanged.' + colors.reset);
-  }
+  console.log(`${colors.cyan}Synth Positions: $${synthPositionsValue.toFixed(2)} | Collateral: $${synthCollateral.toFixed(2)} | Total: $${(synthPositionsValue + synthCollateral).toFixed(2)}${colors.reset}`);
+  console.log(`${colors.cyan}User Positions: $${userPositionsValue.toFixed(2)} | Collateral: $${userCollateral.toFixed(2)} | Total: $${(userPositionsValue + userCollateral).toFixed(2)}${colors.reset}`);
 }
 
-// Helper to create a unique key for a position (market title + outcome)
-function getPositionKey(position) {
-  return `${position.title.toLowerCase()}|${position.outcome.toLowerCase()}`;
-}
-
-// New: Function to compute and log diffs between old and new positions
-function computeAndLogPositionDiffs(oldPositions, newPositions) {
-  const oldMap = new Map(oldPositions.map(p => [getPositionKey(p), p]));
-  const newMap = new Map(newPositions.map(p => [getPositionKey(p), p]));
-
-  console.log(colors.bold + colors.yellow + '\n=== SYNTH POSITION STATE CHANGES ===' + colors.reset);
-
-  let hasChanges = false;
-
-  // Check for added or increased positions
-  for (const [key, newPos] of newMap) {
-    const oldPos = oldMap.get(key);
-    if (!oldPos) {
-      // New position
-      console.log(colors.green + `New Position Added: ${newPos.title} (${newPos.outcome})` + colors.reset);
-      console.log(`Size: ${parseFloat(newPos.size).toFixed(2)} | Avg Price: $${parseFloat(newPos.avgPrice).toFixed(4)}`);
-      hasChanges = true;
-    } else {
-      const oldSize = parseFloat(oldPos.size);
-      const newSize = parseFloat(newPos.size);
-      if (newSize > oldSize) {
-        // Increased
-        const delta = newSize - oldSize;
-        console.log(colors.green + `Position Increased: ${newPos.title} (${newPos.outcome})` + colors.reset);
-        console.log(`Delta: +${delta.toFixed(2)} shares | New Size: ${newSize.toFixed(2)} | New Avg: $${parseFloat(newPos.avgPrice).toFixed(4)} (Old Avg: $${parseFloat(oldPos.avgPrice).toFixed(4)})`);
-        hasChanges = true;
-      } else if (newSize < oldSize) {
-        // Decreased (should be handled in sells, but for completeness)
-        const delta = oldSize - newSize;
-        console.log(colors.red + `Position Decreased: ${newPos.title} (${newPos.outcome})` + colors.reset);
-        console.log(`Delta: -${delta.toFixed(2)} shares | New Size: ${newSize.toFixed(2)} | New Avg: $${parseFloat(newPos.avgPrice).toFixed(4)} (Old Avg: $${parseFloat(oldPos.avgPrice).toFixed(4)})`);
-        hasChanges = true;
-      }
-    }
-  }
-
-  // Check for removed positions
-  for (const [key, oldPos] of oldMap) {
-    if (!newMap.has(key)) {
-      // Removed (sold out or redeemed)
-      console.log(colors.red + `Position Removed: ${oldPos.title} (${oldPos.outcome})` + colors.reset);
-      console.log(`Previous Size: ${parseFloat(oldPos.size).toFixed(2)} | Avg Price: $${parseFloat(oldPos.avgPrice).toFixed(4)}`);
-      hasChanges = true;
-    }
-  }
-
-  if (!hasChanges) {
-    console.log(colors.gray + 'No significant position changes detected.' + colors.reset);
-  }
-
-  console.log(colors.bold + colors.yellow + '--- End of Synth Position State Changes ---' + colors.reset + '\n');
-}
-
-// New: Function to compute and log recommended initial replications
-function computeAndLogRecommendedReplications(mapped) {
-  console.log(colors.bold + colors.blue + '\n=== RECOMMENDED INITIAL POSITIONS TO REPLICATE (based on ratio and min size) ===' + colors.reset);
-
-  let cumulativeCost = 0;
-  let recommended = [];
-  const bufferFactor = 0.9;  // 90% of collateral to leave buffer for fees/slippage
-  const maxBudget = userCollateral * bufferFactor;
-
-  mapped.forEach(p => {
-    const synthQty = parseFloat(p.quantity);
-    let scaledQty = synthQty * currentRatio;
-    scaledQty = Math.floor(scaledQty * 10000) / 10000;  // Round to 4 decimals
-
-    if (scaledQty >= 5) {
-      const estCost = scaledQty * parseFloat(p.currentPrice);
-      if (cumulativeCost + estCost <= maxBudget) {
-        recommended.push({
-          market: p.market,
-          outcome: p.outcome,
-          scaledQty: scaledQty.toFixed(4),
-          estCost: estCost.toFixed(2),
-          currentPrice: p.currentPrice
-        });
-        cumulativeCost += estCost;
-      }
-    }
-  });
-
-  if (recommended.length === 0) {
-    console.log(colors.gray + 'No positions meet the criteria for replication (e.g., min 5 shares after scaling).' + colors.reset);
-  } else {
-    recommended.forEach((r, index) => {
-      console.log(colors.cyan + `Recommended Position ${index + 1}:` + colors.reset + ` ${r.market} (${r.outcome})`);
-      console.log(`${colors.magenta}Scaled Qty:${colors.reset} ${r.scaledQty} | ${colors.magenta}Est Cost:${colors.reset} $${r.estCost} | ${colors.magenta}Curr Price:${colors.reset} $${r.currentPrice}`);
-      console.log(colors.gray + '─'.repeat(80) + colors.reset);
-    });
-    console.log(colors.bold + `Total Estimated Cost: $${cumulativeCost.toFixed(2)} (within $${maxBudget.toFixed(2)} budget)` + colors.reset);
-  }
-
-  console.log(colors.bold + colors.blue + '--- End of Recommended Initial Positions ---' + colors.reset + '\n');
-}
-
-// Fetch Synth positions
+// Fetch Synth positions (updates known markets and value)
 async function fetchPositions(print = false) {
   try {
-    // Store old state before fetching new
-    const oldPositions = [...currentPositions];
-
     const response = await axios.get(`${DATA_API_URL}/positions`, {
       params: { user: SYNTH_ADDRESS, limit: 1000 }
     });
     currentPositions = response.data;
 
-    // Compute and log diffs if not initial fetch
-    if (oldPositions.length > 0) {
-      computeAndLogPositionDiffs(oldPositions, currentPositions);
-    }
+    // Update known markets
+    currentPositions.forEach(p => knownSynthMarkets.add(p.title.toLowerCase()));
 
-    // Map + calculate PnL % + sort by value descending (like UI)
+    // Calculate positions value
     const mapped = currentPositions.map(p => {
       const qty = parseFloat(p.size);
       const value = parseFloat(p.currentValue);
       const avg = parseFloat(p.avgPrice);
       const currentPrice = qty > 0 ? value / qty : 0;
-      const pnl = qty > 0 ? ((currentPrice - avg) / avg) * 100 : 0;
       return {
         market: p.title,
         outcome: p.outcome,
         quantity: qty.toFixed(2),
         value: value.toFixed(2),
         avgPrice: avg.toFixed(2),
-        currentPrice: currentPrice.toFixed(2),
-        pnl: pnl.toFixed(2) + '%',
-        pnlNum: pnl
+        currentPrice: currentPrice.toFixed(2)
       };
-    }).filter(p => parseFloat(p.currentPrice) > 0.05 && parseFloat(p.currentPrice) < 0.95)  // Tightened filter to exclude closer to resolved (0/1)
-      .sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
+    }).sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
 
     synthPositionsValue = 0;
     mapped.forEach(p => {
@@ -256,29 +132,25 @@ async function fetchPositions(print = false) {
 
     if (print) {
       console.log(colors.bold + colors.blue + '\n=== SYNTH CURRENT ACTIVE POSITIONS (sorted by value) ===' + colors.reset);
-      console.log(colors.bold + `Synth Active Positions Total Value: $${synthPositionsValue.toFixed(2)} (excluding near-resolved positions)` + colors.reset);
+      console.log(colors.bold + `Synth Active Positions Total Value: $${synthPositionsValue.toFixed(2)}` + colors.reset);
       if (mapped.length === 0) {
         console.log(colors.gray + 'No active positions currently.' + colors.reset);
       } else {
         mapped.forEach((p, index) => {
-          const pnlColor = p.pnlNum > 0 ? colors.green : p.pnlNum < 0 ? colors.red : colors.gray;
           console.log(colors.cyan + `Position ${index + 1}:` + colors.reset + ` ${p.market} (${p.outcome})`);
           console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg Price:${colors.reset} $${p.avgPrice}`);
-          console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice} | ${colors.magenta}PnL:${colors.reset} ${pnlColor}${p.pnl}${colors.reset}`);
+          console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice}`);
           console.log(colors.gray + '─'.repeat(80) + colors.reset);
         });
       }
       console.log(colors.bold + colors.blue + '--- End of Synth Active Positions ---' + colors.reset + '\n');
-
-      // On initial print, compute and log recommendations
-      computeAndLogRecommendedReplications(mapped);
     }
   } catch (error) {
     console.error(colors.red + 'Error fetching Synth positions:' + colors.reset, error.message);
   }
 }
 
-// New: Fetch user positions (symmetric to fetchPositions)
+// Fetch user positions
 async function fetchUserPositions(print = false) {
   try {
     const response = await axios.get(`${DATA_API_URL}/positions`, {
@@ -286,25 +158,21 @@ async function fetchUserPositions(print = false) {
     });
     userPositions = response.data;
 
-    // Map + calculate PnL % + sort by value descending (like UI)
+    // Calculate positions value
     const mapped = userPositions.map(p => {
       const qty = parseFloat(p.size);
       const value = parseFloat(p.currentValue);
       const avg = parseFloat(p.avgPrice);
       const currentPrice = qty > 0 ? value / qty : 0;
-      const pnl = qty > 0 ? ((currentPrice - avg) / avg) * 100 : 0;
       return {
         market: p.title,
         outcome: p.outcome,
         quantity: qty.toFixed(2),
         value: value.toFixed(2),
         avgPrice: avg.toFixed(2),
-        currentPrice: currentPrice.toFixed(2),
-        pnl: pnl.toFixed(2) + '%',
-        pnlNum: pnl
+        currentPrice: currentPrice.toFixed(2)
       };
-    }).filter(p => parseFloat(p.currentPrice) > 0.05 && parseFloat(p.currentPrice) < 0.95)  // Tightened filter to exclude closer to resolved (0/1)
-      .sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
+    }).sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
 
     userPositionsValue = 0;
     mapped.forEach(p => {
@@ -318,10 +186,9 @@ async function fetchUserPositions(print = false) {
         console.log(colors.gray + 'No active positions currently.' + colors.reset);
       } else {
         mapped.forEach((p, index) => {
-          const pnlColor = p.pnlNum > 0 ? colors.green : p.pnlNum < 0 ? colors.red : colors.gray;
           console.log(colors.cyan + `Position ${index + 1}:` + colors.reset + ` ${p.market} (${p.outcome})`);
           console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg Price:${colors.reset} $${p.avgPrice}`);
-          console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice} | ${colors.magenta}PnL:${colors.reset} ${pnlColor}${p.pnl}${colors.reset}`);
+          console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice}`);
           console.log(colors.gray + '─'.repeat(80) + colors.reset);
         });
       }
@@ -345,46 +212,21 @@ async function resolveTokenId(tokenId) {
         const index = tokenIds.indexOf(tokenId.toString());
         const outcomes = JSON.parse(market.outcomes || '[]');
         const outcome = (index !== -1) ? outcomes[index] || 'Unknown' : 'Unknown';
-        return { market: market.question || 'Unknown', outcome };
+        return { market: market.question || 'Unknown', outcome, slug: market.slug || 'Unknown' };
       }
-      return { market: 'Unknown', outcome: 'Unknown' };
+      return { market: 'Unknown', outcome: 'Unknown', slug: 'Unknown' };
     } catch (error) {
       if (error.response && error.response.status === 404) {
         console.log(`TokenId resolution attempt ${attempt + 1} failed (404) - retrying in 3s...`);
         await sleep(3000);
       } else {
         console.log('Error resolving tokenId (fallback to Unknown):', error.message);
-        return { market: 'Unknown', outcome: 'Unknown' };
+        return { market: 'Unknown', outcome: 'Unknown', slug: 'Unknown' };
       }
     }
   }
   console.log('Failed to resolve tokenId after retries (fallback to Unknown)');
-  return { market: 'Unknown', outcome: 'Unknown' };
-}
-
-// Resolve conditionId → market (for redeems; outcomes from indexSets)
-async function resolveConditionId(conditionId) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      const response = await axios.get(`${GAMMA_API_URL}/markets`, {
-        params: { condition_ids: conditionId, limit: 1 }
-      });
-      if (response.data.length > 0) {
-        return response.data[0];  // Returns full market with outcomes
-      }
-      return null;
-    } catch (error) {
-      if (error.response && error.response.status === 404) {
-        console.log(`ConditionId resolution attempt ${attempt + 1} failed (404) - retrying in 3s...`);
-        await sleep(3000);
-      } else {
-        console.log('Error resolving conditionId (fallback to Unknown):', error.message);
-        return null;
-      }
-    }
-  }
-  console.log('Failed to resolve conditionId after retries (fallback to Unknown)');
-  return null;
+  return { market: 'Unknown', outcome: 'Unknown', slug: 'Unknown' };
 }
 
 // Handle trade log
@@ -424,82 +266,38 @@ async function handleTradeLog(log) {
 
   const { market, outcome } = await resolveTokenId(outcomeTokenId);
 
-  const trade = {
-    time: new Date().toISOString().split('T')[1].split('.')[0],
-    side,
-    market,
-    outcome,
-    shares: parseFloat(ethers.utils.formatUnits(tokenAmount, 6)).toFixed(2),
-    usdc: parseFloat(ethers.utils.formatUnits(usdcAmount, 6)).toFixed(2),
-    price: price.toFixed(4),
-    tx: log.transactionHash
-  };
+  // Check if this is a new market
+  const marketKey = market.toLowerCase();
+  const isNewMarket = !knownSynthMarkets.has(marketKey);
 
-  addToRecentTrades(trade);
-}
+  if (isNewMarket) {
+    knownSynthMarkets.add(marketKey);
+  }
 
-// Handle redeem log
-async function handleRedeemLog(log) {
-  if (log.address.toLowerCase() !== CTF_CONTRACT) return;
-  if (log.topics[0] !== PAYOUT_REDEMPTION_TOPIC) return;
+  const time = new Date().toISOString().split('T')[1].split('.')[0];
+  const shares = parseFloat(ethers.utils.formatUnits(tokenAmount, 6)).toFixed(2);
+  const usdc = parseFloat(ethers.utils.formatUnits(usdcAmount, 6)).toFixed(2);
+  // const tx = log.transactionHash.slice(0, 10) + '...';
+  const tx = log.transactionHash;
 
-  const iface = new ethers.utils.Interface([`event PayoutRedemption(
-    address indexed redeemer,
-    address indexed collateralToken,
-    bytes32 indexed parentCollectionId,
-    bytes32 conditionId,
-    uint256[] indexSets,
-    uint256 payout
-  )`]);
-  const decoded = iface.parseLog(log);
+  const sideColor = isBuy ? colors.green : colors.red;
 
-  const redeemer = decoded.args.redeemer.toLowerCase();
-  if (redeemer !== SYNTH_ADDRESS) return;
+  if (isNewMarket) {
+    // Full colored log for new markets
+    console.log(colors.bold + colors.yellow + '\n🚨 NEW TRADE IN NEW MARKET!' + colors.reset);
+    console.log(`${colors.cyan}Time:${colors.reset} ${time} | ${colors.cyan}Side:${colors.reset} ${sideColor}${side}${colors.reset} | ${colors.cyan}Outcome:${colors.reset} ${outcome}`);
+    console.log(`${colors.cyan}Market:${colors.reset} ${market}`);
+    console.log(`${colors.cyan}Shares:${colors.reset} ${shares} | ${colors.cyan}USDC:${colors.reset} $${usdc} | ${colors.cyan}Price:${colors.reset} $${price.toFixed(4)}`);
+    console.log(`${colors.cyan}Tx:${colors.reset} https://polygonscan.com/tx/${tx}`);
+    console.log(colors.gray + '─'.repeat(80) + colors.reset);
+  } else {
+    // Gray one-liner for pre-existing markets
+    console.log(colors.gray + `Minor trade: ${sideColor}${side}${colors.reset} ${shares} shares of ${outcome} in ${market} at $${price.toFixed(4)} (Tx: ${tx.slice(0, 10) + '...'})` + colors.reset);
+  }
 
-  const conditionId = decoded.args.conditionId;
-  const indexSets = decoded.args.indexSets;
-  const payout = decoded.args.payout;
-
-  const marketData = await resolveConditionId(conditionId);
-  const market = marketData ? marketData.question : 'Unknown';
-  // Assume binary market; indexSets[0] == 1 for 'Yes' (index 0), 2 for 'No' (index 1)
-  const outcomeIndex = indexSets[0].eq(1) ? 0 : 1;
-  const outcomes = JSON.parse(marketData?.outcomes || '[]');
-  const outcome = outcomes[outcomeIndex] || 'Unknown';
-  const shares = parseFloat(ethers.utils.formatUnits(payout, 6)).toFixed(2);
-
-  const trade = {
-    time: new Date().toISOString().split('T')[1].split('.')[0],
-    side: 'REDEEM',
-    market,
-    outcome,
-    shares,
-    usdc: parseFloat(ethers.utils.formatUnits(payout, 6)).toFixed(2),
-    price: '1.0000',  // Resolved winner redeems at $1
-    tx: log.transactionHash
-  };
-
-  addToRecentTrades(trade);
-}
-
-// Add to recent and log
-function addToRecentTrades(trade) {
-  recentTrades.unshift(trade);
-  if (recentTrades.length > MAX_TRADES) recentTrades.pop();
-
-  const sideColor = trade.side === 'BUY' ? colors.green : trade.side === 'SELL' ? colors.red : colors.yellow;
-  console.log(colors.bold + colors.yellow + '\n🚨 NEW ACTIVITY DETECTED!' + colors.reset);
-  console.log(`${colors.cyan}Time:${colors.reset} ${trade.time} | ${colors.cyan}Side:${colors.reset} ${sideColor}${trade.side}${colors.reset} | ${colors.cyan}Outcome:${colors.reset} ${trade.outcome}`);
-  console.log(`${colors.cyan}Market:${colors.reset} ${trade.market}`);
-  console.log(`${colors.cyan}Shares:${colors.reset} ${trade.shares} | ${colors.cyan}USDC:${colors.reset} $${trade.usdc} | ${colors.cyan}Price:${colors.reset} $${trade.price}`);
-  console.log(`${colors.cyan}Tx:${colors.reset} https://polygonscan.com/tx/${trade.tx.slice(0, 10) + '...'}`);
-  console.log(colors.gray + '─'.repeat(80) + colors.reset);
-
-  // Refresh positions to update state
-  fetchPositions();
-
-  // Refresh ratio after activity
-  refreshRatio();
+  // Debounced refresh
+  if (refreshTimeout) clearTimeout(refreshTimeout);
+  refreshTimeout = setTimeout(refreshTotals, 10000);  // 10s debounce
 }
 
 // Start tracker
@@ -509,23 +307,17 @@ function startTracker() {
   provider._websocket.on('open', async () => {
     console.log(colors.green + 'Connected to Polygon websocket' + colors.reset);
 
-    // Initial fetches and ratio
-    await refreshRatio();  // First compute ratio (fetches positions)
-    await fetchPositions(true);  // Then print Synth positions with recommendations using updated ratio
-    await fetchUserPositions(true);  // Initial user print
+    // Initial fetches
+    await fetchPositions(true);  // Print initial Synth positions
+    await fetchUserPositions(true);  // Print initial User positions
+    await refreshTotals();  // Initial totals
 
-    // Periodic refresh every 5 minutes
-    setInterval(refreshRatio, 300000);
+    console.log(colors.bold + colors.yellow + `Initialized with ${knownSynthMarkets.size} known markets. Waiting for new trades...` + colors.reset);
   });
 
   // Trade filter
   const tradeFilter = { address: EXCHANGE_CONTRACT, topics: [ORDER_FILLED_TOPIC] };
   provider.on(tradeFilter, handleTradeLog);
-
-  // Redeem filter (filter by redeemer topic)
-  const redeemTopics = [PAYOUT_REDEMPTION_TOPIC, ethers.utils.hexZeroPad(SYNTH_ADDRESS, 32)];
-  const redeemFilter = { address: CTF_CONTRACT, topics: redeemTopics };
-  provider.on(redeemFilter, handleRedeemLog);
 
   provider._websocket.on('close', () => {
     console.log(colors.yellow + 'WebSocket closed. Reconnecting...' + colors.reset);
