@@ -16,11 +16,24 @@ const colors = {
 
 // Config
 const SYNTH_ADDRESS = '0x557bed924a1bb6f62842c5742d1dc789b8d480d4'.toLowerCase();
+const USER_ADDRESS = '0x2ddc093099a5722dc017c70e756dd3ea5586951e'.toLowerCase();  // New: Your wallet address
 const EXCHANGE_CONTRACT = '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e'.toLowerCase();
 const CTF_CONTRACT = '0x4d97dcd97ec945f40cf65f87097ace5ea0476045'.toLowerCase();
+const USDC_ADDRESS = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'.toLowerCase();  // New: USDC contract on Polygon
 const POLYGON_WS_URL = 'wss://polygon-mainnet.g.alchemy.com/v2/PLG7HaKwMvU9g5Ajifosm';  // Keep your key here
 const DATA_API_URL = 'https://data-api.polymarket.com';
 const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
+
+// New: USDC ABI for balanceOf
+const USDC_ABI = [
+  {
+    "inputs": [{"name": "account", "type": "address"}],
+    "name": "balanceOf",
+    "outputs": [{"name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function"
+  }
+];
 
 // Topics
 const ORDER_FILLED_TOPIC = ethers.utils.keccak256(ethers.utils.toUtf8Bytes(
@@ -32,12 +45,65 @@ const PAYOUT_REDEMPTION_TOPIC = ethers.utils.keccak256(ethers.utils.toUtf8Bytes(
 
 // In-memory state
 let currentPositions = [];
-let recentTrades = [];  // Includes trades and redeems; last 20
-const MAX_TRADES = 20;
+let recentTrades = [];  // Includes trades and redeems; last 5 now
+const MAX_TRADES = 5;
+
+// Global provider
+let provider;
+
+// Global ratio (for dynamic use)
+let currentRatio = 0;
 
 // Function to sleep
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Helper to fetch aggregated positions value via Data API
+async function getPositionsValue(address) {
+  try {
+    const response = await axios.get(`${DATA_API_URL}/value`, {
+      params: { user: address }
+    });
+    return parseFloat(response.data[0]?.value || 0);
+  } catch (error) {
+    console.error(colors.red + `Error fetching positions value for ${address}:` + colors.reset, error.message);
+    return 0;
+  }
+}
+
+// Helper to fetch USDC collateral balance on-chain
+async function getCollateral(address) {
+  try {
+    const usdcContract = new ethers.Contract(USDC_ADDRESS, USDC_ABI, provider);
+    const rawBalance = await usdcContract.balanceOf(address);
+    return parseFloat(ethers.utils.formatUnits(rawBalance, 6));
+  } catch (error) {
+    console.error(colors.red + `Error fetching collateral for ${address}:` + colors.reset, error.message);
+    return 0;
+  }
+}
+
+// New: Function to refresh and log ratio dynamically
+async function refreshRatio() {
+  console.log(colors.green + 'Refreshing balances...' + colors.reset);
+  const synthPositions = await getPositionsValue(SYNTH_ADDRESS);
+  const synthCollateral = await getCollateral(SYNTH_ADDRESS);
+  const synthTotal = synthPositions + synthCollateral;
+  const userPositions = await getPositionsValue(USER_ADDRESS);
+  const userCollateral = await getCollateral(USER_ADDRESS);
+  const userTotal = userPositions + userCollateral;
+  const newRatio = synthTotal > 0 ? userTotal / synthTotal : 0;
+
+  // Log only if significant change
+  if (Math.abs(newRatio - currentRatio) > 0.001) {
+    console.log(`${colors.cyan}Synth Positions: $${synthPositions.toFixed(2)} | Collateral: $${synthCollateral.toFixed(2)} | Total: $${synthTotal.toFixed(2)}${colors.reset}`);
+    console.log(`${colors.cyan}User Positions: $${userPositions.toFixed(2)} | Collateral: $${userCollateral.toFixed(2)} | Total: $${userTotal.toFixed(2)}${colors.reset}`);
+    console.log(colors.bold + `Updated Copy Ratio: ${newRatio.toFixed(4)}` + colors.reset);
+    currentRatio = newRatio;
+  } else {
+    console.log(colors.gray + 'Ratio unchanged.' + colors.reset);
+  }
 }
 
 // Fetch positions
@@ -66,17 +132,21 @@ async function fetchPositions(print = false) {
           pnl: pnl.toFixed(2) + '%',
           pnlNum: pnl
         };
-      }).sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
+      }).filter(p => parseFloat(p.currentPrice) !== 0 && parseFloat(p.currentPrice) !== 1)  // New: Filter out resolved ($0 or $1)
+        .sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
 
-      console.log(colors.bold + colors.blue + '\n=== CURRENT POSITIONS (sorted by value) ===' + colors.reset);
+      console.log(colors.bold + colors.blue + '\n=== CURRENT ACTIVE POSITIONS (sorted by value) ===' + colors.reset);
+      let activeTotal = 0;
       mapped.forEach((p, index) => {
+        activeTotal += parseFloat(p.value);
         const pnlColor = p.pnlNum > 0 ? colors.green : p.pnlNum < 0 ? colors.red : colors.gray;
         console.log(colors.cyan + `Position ${index + 1}:` + colors.reset + ` ${p.market} (${p.outcome})`);
         console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg Price:${colors.reset} $${p.avgPrice}`);
         console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice} | ${colors.magenta}PnL:${colors.reset} ${pnlColor}${p.pnl}${colors.reset}`);
         console.log(colors.gray + '─'.repeat(80) + colors.reset);
       });
-      console.log(colors.bold + colors.blue + '--- End of Positions ---' + colors.reset + '\n');
+      console.log(colors.bold + `Active Positions Total Value: $${activeTotal.toFixed(2)}` + colors.reset);
+      console.log(colors.bold + colors.blue + '--- End of Active Positions ---' + colors.reset + '\n');
     }
   } catch (error) {
     console.error(colors.red + 'Error fetching positions:' + colors.reset, error.message);
@@ -248,31 +318,25 @@ function addToRecentTrades(trade) {
 
   // Silent refresh positions
   fetchPositions();
-}
 
-// Print recent activity
-function printRecentActivity() {
-  if (recentTrades.length === 0) return;
-  console.log(colors.bold + colors.blue + '\n=== RECENT ACTIVITY (last ' + recentTrades.length + ') ===' + colors.reset);
-  recentTrades.forEach((t, index) => {
-    const sideColor = t.side === 'BUY' ? colors.green : t.side === 'SELL' ? colors.red : colors.yellow;
-    console.log(colors.magenta + `Activity ${index + 1}:` + colors.reset + ` ${t.market} (${t.outcome})`);
-    console.log(`Time: ${t.time} | Side: ${sideColor}${t.side}${colors.reset} | Shares: ${t.shares}`);
-    console.log(`USDC: $${t.usdc} | Price: $${t.price}`);
-    console.log(`Tx: https://polygonscan.com/tx/${t.tx.slice(0, 10) + '...'}`);
-    console.log(colors.gray + '─'.repeat(80) + colors.reset);
-  });
-  console.log(colors.bold + colors.blue + '--- End of Recent Activity ---' + colors.reset + '\n');
+  // New: Refresh ratio after activity
+  refreshRatio();
 }
 
 // Start tracker
 function startTracker() {
-  const provider = new ethers.providers.WebSocketProvider(POLYGON_WS_URL);
+  provider = new ethers.providers.WebSocketProvider(POLYGON_WS_URL);
 
-  provider._websocket.on('open', () => {
+  provider._websocket.on('open', async () => {
     console.log(colors.green + 'Connected to Polygon websocket' + colors.reset);
+
+    // Initial refresh ratio
+    await refreshRatio();
+
+    // New: Periodic refresh every 5 minutes
+    setInterval(refreshRatio, 300000);
+
     fetchPositions(true);  // Initial print
-    setInterval(printRecentActivity, 60000);
   });
 
   // Trade filter
