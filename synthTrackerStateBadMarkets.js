@@ -57,7 +57,6 @@ let currentRatio = 0;
 
 // Global values for recommendations
 let synthPositionsValue = 0;
-let userPositionsValue = 0;
 let userCollateral = 0;
 
 // Function to sleep
@@ -93,18 +92,18 @@ async function getCollateral(address) {
 // New: Function to refresh and log ratio dynamically
 async function refreshRatio() {
   console.log(colors.green + 'Refreshing balances...' + colors.reset);
-  await fetchPositions();
-  await fetchUserPositions();
+  synthPositionsValue = await getPositionsValue(SYNTH_ADDRESS);
   const synthCollateral = await getCollateral(SYNTH_ADDRESS);
   const synthTotal = synthPositionsValue + synthCollateral;
+  const userPositions = await getPositionsValue(USER_ADDRESS);
   userCollateral = await getCollateral(USER_ADDRESS);
-  const userTotal = userPositionsValue + userCollateral;
+  const userTotal = userPositions + userCollateral;
   const newRatio = synthPositionsValue > 0 ? userTotal / synthPositionsValue : 0;
 
   // Log only if significant change
   if (Math.abs(newRatio - currentRatio) > 0.001) {
     console.log(`${colors.cyan}Synth Positions: $${synthPositionsValue.toFixed(2)} | Collateral: $${synthCollateral.toFixed(2)} | Total: $${synthTotal.toFixed(2)}${colors.reset}`);
-    console.log(`${colors.cyan}User Positions: $${userPositionsValue.toFixed(2)} | Collateral: $${userCollateral.toFixed(2)} | Total: $${userTotal.toFixed(2)}${colors.reset}`);
+    console.log(`${colors.cyan}User Positions: $${userPositions.toFixed(2)} | Collateral: $${userCollateral.toFixed(2)} | Total: $${userTotal.toFixed(2)}${colors.reset}`);
     console.log(colors.bold + `Updated Copy Ratio: ${newRatio.toFixed(4)}` + colors.reset);
     currentRatio = newRatio;
   } else {
@@ -229,45 +228,38 @@ async function fetchPositions(print = false) {
       computeAndLogPositionDiffs(oldPositions, currentPositions);
     }
 
-    // Map + calculate PnL % + sort by value descending (like UI)
-    const mapped = currentPositions.map(p => {
-      const qty = parseFloat(p.size);
-      const value = parseFloat(p.currentValue);
-      const avg = parseFloat(p.avgPrice);
-      const currentPrice = qty > 0 ? value / qty : 0;
-      const pnl = qty > 0 ? ((currentPrice - avg) / avg) * 100 : 0;
-      return {
-        market: p.title,
-        outcome: p.outcome,
-        quantity: qty.toFixed(2),
-        value: value.toFixed(2),
-        avgPrice: avg.toFixed(2),
-        currentPrice: currentPrice.toFixed(2),
-        pnl: pnl.toFixed(2) + '%',
-        pnlNum: pnl
-      };
-    }).filter(p => parseFloat(p.currentPrice) > 0.01 && parseFloat(p.currentPrice) < 0.99)  // Filter out near-resolved ($0.01 or $0.99)
-      .sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
-
-    synthPositionsValue = 0;
-    mapped.forEach(p => {
-      synthPositionsValue += parseFloat(p.value);
-    });
-
     if (print) {
+      // Map + calculate PnL % + sort by value descending (like UI)
+      const mapped = currentPositions.map(p => {
+        const qty = parseFloat(p.size);
+        const value = parseFloat(p.currentValue);
+        const avg = parseFloat(p.avgPrice);
+        const currentPrice = qty > 0 ? value / qty : 0;
+        const pnl = qty > 0 ? ((currentPrice - avg) / avg) * 100 : 0;
+        return {
+          market: p.title,
+          outcome: p.outcome,
+          quantity: qty.toFixed(2),
+          value: value.toFixed(2),
+          avgPrice: avg.toFixed(2),
+          currentPrice: currentPrice.toFixed(2),
+          pnl: pnl.toFixed(2) + '%',
+          pnlNum: pnl
+        };
+      }).filter(p => parseFloat(p.currentPrice) !== 0 && parseFloat(p.currentPrice) !== 1)  // Filter out resolved ($0 or $1)
+        .sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
+
       console.log(colors.bold + colors.blue + '\n=== SYNTH CURRENT ACTIVE POSITIONS (sorted by value) ===' + colors.reset);
-      console.log(colors.bold + `Synth Active Positions Total Value: $${synthPositionsValue.toFixed(2)} (excluding near-resolved positions)` + colors.reset);
-      if (mapped.length === 0) {
-        console.log(colors.gray + 'No active positions currently.' + colors.reset);
-      } else {
-        mapped.forEach((p, index) => {
-          const pnlColor = p.pnlNum > 0 ? colors.green : p.pnlNum < 0 ? colors.red : colors.gray;
-          console.log(colors.cyan + `Position ${index + 1}:` + colors.reset + ` ${p.market} (${p.outcome})`);
-          console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg Price:${colors.reset} $${p.avgPrice}`);
-          console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice} | ${colors.magenta}PnL:${colors.reset} ${pnlColor}${p.pnl}${colors.reset}`);
-          console.log(colors.gray + '─'.repeat(80) + colors.reset);
-        });
-      }
+      let activeTotal = 0;
+      mapped.forEach((p, index) => {
+        activeTotal += parseFloat(p.value);
+        const pnlColor = p.pnlNum > 0 ? colors.green : p.pnlNum < 0 ? colors.red : colors.gray;
+        console.log(colors.cyan + `Position ${index + 1}:` + colors.reset + ` ${p.market} (${p.outcome})`);
+        console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg Price:${colors.reset} $${p.avgPrice}`);
+        console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice} | ${colors.magenta}PnL:${colors.reset} ${pnlColor}${p.pnl}${colors.reset}`);
+        console.log(colors.gray + '─'.repeat(80) + colors.reset);
+      });
+      console.log(colors.bold + `Synth Active Positions Total Value: $${activeTotal.toFixed(2)} (excluding resolved positions)` + colors.reset);
       console.log(colors.bold + colors.blue + '--- End of Synth Active Positions ---' + colors.reset + '\n');
 
       // On initial print, compute and log recommendations
@@ -286,38 +278,34 @@ async function fetchUserPositions(print = false) {
     });
     userPositions = response.data;
 
-    // Map + calculate PnL % + sort by value descending (like UI)
-    const mapped = userPositions.map(p => {
-      const qty = parseFloat(p.size);
-      const value = parseFloat(p.currentValue);
-      const avg = parseFloat(p.avgPrice);
-      const currentPrice = qty > 0 ? value / qty : 0;
-      const pnl = qty > 0 ? ((currentPrice - avg) / avg) * 100 : 0;
-      return {
-        market: p.title,
-        outcome: p.outcome,
-        quantity: qty.toFixed(2),
-        value: value.toFixed(2),
-        avgPrice: avg.toFixed(2),
-        currentPrice: currentPrice.toFixed(2),
-        pnl: pnl.toFixed(2) + '%',
-        pnlNum: pnl
-      };
-    }).filter(p => parseFloat(p.currentPrice) > 0.01 && parseFloat(p.currentPrice) < 0.99)  // Filter out near-resolved ($0.01 or $0.99)
-      .sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
-
-    userPositionsValue = 0;
-    mapped.forEach(p => {
-      userPositionsValue += parseFloat(p.value);
-    });
-
     if (print) {
+      // Map + calculate PnL % + sort by value descending (like UI)
+      const mapped = userPositions.map(p => {
+        const qty = parseFloat(p.size);
+        const value = parseFloat(p.currentValue);
+        const avg = parseFloat(p.avgPrice);
+        const currentPrice = qty > 0 ? value / qty : 0;
+        const pnl = qty > 0 ? ((currentPrice - avg) / avg) * 100 : 0;
+        return {
+          market: p.title,
+          outcome: p.outcome,
+          quantity: qty.toFixed(2),
+          value: value.toFixed(2),
+          avgPrice: avg.toFixed(2),
+          currentPrice: currentPrice.toFixed(2),
+          pnl: pnl.toFixed(2) + '%',
+          pnlNum: pnl
+        };
+      }).filter(p => parseFloat(p.currentPrice) !== 0 && parseFloat(p.currentPrice) !== 1)  // Filter out resolved ($0 or $1)
+        .sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
+
       console.log(colors.bold + colors.blue + '\n=== USER CURRENT ACTIVE POSITIONS (sorted by value) ===' + colors.reset);
-      console.log(colors.bold + `User Active Positions Total Value: $${userPositionsValue.toFixed(2)}` + colors.reset);
+      let activeTotal = 0;
       if (mapped.length === 0) {
         console.log(colors.gray + 'No active positions currently.' + colors.reset);
       } else {
         mapped.forEach((p, index) => {
+          activeTotal += parseFloat(p.value);
           const pnlColor = p.pnlNum > 0 ? colors.green : p.pnlNum < 0 ? colors.red : colors.gray;
           console.log(colors.cyan + `Position ${index + 1}:` + colors.reset + ` ${p.market} (${p.outcome})`);
           console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg Price:${colors.reset} $${p.avgPrice}`);
@@ -325,6 +313,7 @@ async function fetchUserPositions(print = false) {
           console.log(colors.gray + '─'.repeat(80) + colors.reset);
         });
       }
+      console.log(colors.bold + `User Active Positions Total Value: $${activeTotal.toFixed(2)}` + colors.reset);
       console.log(colors.bold + colors.blue + '--- End of User Active Positions ---' + colors.reset + '\n');
     }
   } catch (error) {
@@ -509,13 +498,14 @@ function startTracker() {
   provider._websocket.on('open', async () => {
     console.log(colors.green + 'Connected to Polygon websocket' + colors.reset);
 
-    // Initial fetches and ratio
-    await refreshRatio();  // First compute ratio (fetches positions)
-    await fetchPositions(true);  // Then print Synth positions with recommendations using updated ratio
-    await fetchUserPositions(true);  // Initial user print
+    // Initial refresh ratio
+    await refreshRatio();
 
     // Periodic refresh every 5 minutes
     setInterval(refreshRatio, 300000);
+
+    await fetchPositions(true);  // Initial Synth print with recommendations
+    await fetchUserPositions(true);  // New: Initial user print
   });
 
   // Trade filter

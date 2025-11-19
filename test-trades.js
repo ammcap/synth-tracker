@@ -13,8 +13,8 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS || '';  // If empty, defaults to signer.address
 const POLYGON_RPC_URL = process.env.POLYGON_RPC_URL;
 const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';  // ConditionalTokens contract
-const MARKET_SLUG = 'ethereum-up-or-down-november-18-5pm-et';  // Updated market slug
-const OUTCOME = 'Down';  // Low-priced outcome for sub-$1 test
+const MARKET_SLUG = 'eth-updown-15m-1763560800';  // Updated market slug
+const OUTCOME = 'Up';  // Low-priced outcome for sub-$1 test
 const AMOUNT_USDC = 0.5;  // Sub-$1 test trade
 const SIGNATURE_TYPE = 2;  // 2 for smart contract wallets (EIP-1271)
 
