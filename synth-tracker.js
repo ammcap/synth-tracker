@@ -106,9 +106,6 @@ async function fetchPositions(print = false) {
     });
     currentPositions = response.data;
 
-    // Update known markets
-    currentPositions.forEach(p => knownSynthMarkets.add(p.title.toLowerCase()));
-
     // Calculate positions value
     const mapped = currentPositions.map(p => {
       const qty = parseFloat(p.size);
@@ -266,13 +263,9 @@ async function handleTradeLog(log) {
 
   const { market, outcome } = await resolveTokenId(outcomeTokenId);
 
-  // Check if this is a new market
+  // Check if this is a new market (not in startup known markets)
   const marketKey = market.toLowerCase();
   const isNewMarket = !knownSynthMarkets.has(marketKey);
-
-  if (isNewMarket) {
-    knownSynthMarkets.add(marketKey);
-  }
 
   const time = new Date().toISOString().split('T')[1].split('.')[0];
   const shares = parseFloat(ethers.utils.formatUnits(tokenAmount, 6)).toFixed(2);
@@ -292,7 +285,8 @@ async function handleTradeLog(log) {
     console.log(colors.gray + '─'.repeat(80) + colors.reset);
   } else {
     // Gray one-liner for pre-existing markets
-    console.log(colors.gray + `Minor trade: ${sideColor}${side}${colors.reset} ${shares} shares of ${outcome} in ${market} at $${price.toFixed(4)} (Tx: ${tx.slice(0, 10) + '...'})` + colors.reset);
+    // console.log(colors.gray + `Minor trade: ${sideColor}${side}${colors.reset} ${shares} shares of ${outcome} in ${market} at $${price.toFixed(4)}\n(Tx: ${tx})` + colors.reset);
+    console.log(colors.gray + `Minor trade: ${sideColor}${side}${colors.reset} ${shares} shares of ${outcome} in ${market} at $${price.toFixed(4)}` + colors.reset);
   }
 
   // Debounced refresh
@@ -309,6 +303,8 @@ function startTracker() {
 
     // Initial fetches
     await fetchPositions(true);  // Print initial Synth positions
+    // Initialize known markets only once, from startup positions
+    currentPositions.forEach(p => knownSynthMarkets.add(p.title.toLowerCase()));
     await fetchUserPositions(true);  // Print initial User positions
     await refreshTotals();  // Initial totals
 
