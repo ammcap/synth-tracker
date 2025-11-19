@@ -246,7 +246,7 @@ async function fetchPositions(print = false) {
         pnl: pnl.toFixed(2) + '%',
         pnlNum: pnl
       };
-    }).filter(p => parseFloat(p.currentPrice) > 0.01 && parseFloat(p.currentPrice) < 0.99)  // Filter out near-resolved ($0.01 or $0.99)
+    }).filter(p => parseFloat(p.currentPrice) > 0.05 && parseFloat(p.currentPrice) < 0.95)  // Tightened filter to exclude closer to resolved (0/1)
       .sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
 
     synthPositionsValue = 0;
@@ -303,7 +303,7 @@ async function fetchUserPositions(print = false) {
         pnl: pnl.toFixed(2) + '%',
         pnlNum: pnl
       };
-    }).filter(p => parseFloat(p.currentPrice) > 0.01 && parseFloat(p.currentPrice) < 0.99)  // Filter out near-resolved ($0.01 or $0.99)
+    }).filter(p => parseFloat(p.currentPrice) > 0.05 && parseFloat(p.currentPrice) < 0.95)  // Tightened filter to exclude closer to resolved (0/1)
       .sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
 
     userPositionsValue = 0;
