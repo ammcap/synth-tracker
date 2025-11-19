@@ -16,15 +16,15 @@ const colors = {
 
 // Config
 const SYNTH_ADDRESS = '0x557bed924a1bb6f62842c5742d1dc789b8d480d4'.toLowerCase();
-const USER_ADDRESS = '0x2ddc093099a5722dc017c70e756dd3ea5586951e'.toLowerCase();  // New: Your wallet address
+const USER_ADDRESS = '0x2ddc093099a5722dc017c70e756dd3ea5586951e'.toLowerCase();  // Your wallet address
 const EXCHANGE_CONTRACT = '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e'.toLowerCase();
 const CTF_CONTRACT = '0x4d97dcd97ec945f40cf65f87097ace5ea0476045'.toLowerCase();
-const USDC_ADDRESS = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'.toLowerCase();  // New: USDC contract on Polygon
+const USDC_ADDRESS = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'.toLowerCase();  // USDC contract on Polygon
 const POLYGON_WS_URL = 'wss://polygon-mainnet.g.alchemy.com/v2/PLG7HaKwMvU9g5Ajifosm';  // Keep your key here
 const DATA_API_URL = 'https://data-api.polymarket.com';
 const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
 
-// New: USDC ABI for balanceOf
+// USDC ABI for balanceOf
 const USDC_ABI = [
   {
     "inputs": [{"name": "account", "type": "address"}],
@@ -44,8 +44,9 @@ const PAYOUT_REDEMPTION_TOPIC = ethers.utils.keccak256(ethers.utils.toUtf8Bytes(
 ));
 
 // In-memory state
-let currentPositions = [];
-let recentTrades = [];  // Includes trades and redeems; last 5 now
+let currentPositions = [];  // Synth's positions
+let userPositions = [];     // New: Your positions
+let recentTrades = [];      // Includes trades and redeems; last 5
 const MAX_TRADES = 5;
 
 // Global provider
@@ -106,7 +107,7 @@ async function refreshRatio() {
   }
 }
 
-// Fetch positions
+// Fetch Synth positions
 async function fetchPositions(print = false) {
   try {
     const response = await axios.get(`${DATA_API_URL}/positions`, {
@@ -132,10 +133,10 @@ async function fetchPositions(print = false) {
           pnl: pnl.toFixed(2) + '%',
           pnlNum: pnl
         };
-      }).filter(p => parseFloat(p.currentPrice) !== 0 && parseFloat(p.currentPrice) !== 1)  // New: Filter out resolved ($0 or $1)
+      }).filter(p => parseFloat(p.currentPrice) !== 0 && parseFloat(p.currentPrice) !== 1)  // Filter out resolved ($0 or $1)
         .sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
 
-      console.log(colors.bold + colors.blue + '\n=== CURRENT ACTIVE POSITIONS (sorted by value) ===' + colors.reset);
+      console.log(colors.bold + colors.blue + '\n=== SYNTH CURRENT ACTIVE POSITIONS (sorted by value) ===' + colors.reset);
       let activeTotal = 0;
       mapped.forEach((p, index) => {
         activeTotal += parseFloat(p.value);
@@ -145,11 +146,62 @@ async function fetchPositions(print = false) {
         console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice} | ${colors.magenta}PnL:${colors.reset} ${pnlColor}${p.pnl}${colors.reset}`);
         console.log(colors.gray + '─'.repeat(80) + colors.reset);
       });
-      console.log(colors.bold + `Active Positions Total Value: $${activeTotal.toFixed(2)}` + colors.reset);
-      console.log(colors.bold + colors.blue + '--- End of Active Positions ---' + colors.reset + '\n');
+      console.log(colors.bold + `Synth Active Positions Total Value: $${activeTotal.toFixed(2)} (excluding resolved positions)` + colors.reset);
+      console.log(colors.bold + colors.blue + '--- End of Synth Active Positions ---' + colors.reset + '\n');
     }
   } catch (error) {
-    console.error(colors.red + 'Error fetching positions:' + colors.reset, error.message);
+    console.error(colors.red + 'Error fetching Synth positions:' + colors.reset, error.message);
+  }
+}
+
+// New: Fetch user positions (symmetric to fetchPositions)
+async function fetchUserPositions(print = false) {
+  try {
+    const response = await axios.get(`${DATA_API_URL}/positions`, {
+      params: { user: USER_ADDRESS, limit: 1000 }
+    });
+    userPositions = response.data;
+
+    if (print) {
+      // Map + calculate PnL % + sort by value descending (like UI)
+      const mapped = userPositions.map(p => {
+        const qty = parseFloat(p.size);
+        const value = parseFloat(p.currentValue);
+        const avg = parseFloat(p.avgPrice);
+        const currentPrice = qty > 0 ? value / qty : 0;
+        const pnl = qty > 0 ? ((currentPrice - avg) / avg) * 100 : 0;
+        return {
+          market: p.title,
+          outcome: p.outcome,
+          quantity: qty.toFixed(2),
+          value: value.toFixed(2),
+          avgPrice: avg.toFixed(2),
+          currentPrice: currentPrice.toFixed(2),
+          pnl: pnl.toFixed(2) + '%',
+          pnlNum: pnl
+        };
+      }).filter(p => parseFloat(p.currentPrice) !== 0 && parseFloat(p.currentPrice) !== 1)  // Filter out resolved ($0 or $1)
+        .sort((a, b) => parseFloat(b.value) - parseFloat(a.value));
+
+      console.log(colors.bold + colors.blue + '\n=== USER CURRENT ACTIVE POSITIONS (sorted by value) ===' + colors.reset);
+      let activeTotal = 0;
+      if (mapped.length === 0) {
+        console.log(colors.gray + 'No active positions currently.' + colors.reset);
+      } else {
+        mapped.forEach((p, index) => {
+          activeTotal += parseFloat(p.value);
+          const pnlColor = p.pnlNum > 0 ? colors.green : p.pnlNum < 0 ? colors.red : colors.gray;
+          console.log(colors.cyan + `Position ${index + 1}:` + colors.reset + ` ${p.market} (${p.outcome})`);
+          console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg Price:${colors.reset} $${p.avgPrice}`);
+          console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice} | ${colors.magenta}PnL:${colors.reset} ${pnlColor}${p.pnl}${colors.reset}`);
+          console.log(colors.gray + '─'.repeat(80) + colors.reset);
+        });
+      }
+      console.log(colors.bold + `User Active Positions Total Value: $${activeTotal.toFixed(2)}` + colors.reset);
+      console.log(colors.bold + colors.blue + '--- End of User Active Positions ---' + colors.reset + '\n');
+    }
+  } catch (error) {
+    console.error(colors.red + 'Error fetching user positions:' + colors.reset, error.message);
   }
 }
 
@@ -319,7 +371,7 @@ function addToRecentTrades(trade) {
   // Silent refresh positions
   fetchPositions();
 
-  // New: Refresh ratio after activity
+  // Refresh ratio after activity
   refreshRatio();
 }
 
@@ -333,10 +385,11 @@ function startTracker() {
     // Initial refresh ratio
     await refreshRatio();
 
-    // New: Periodic refresh every 5 minutes
+    // Periodic refresh every 5 minutes
     setInterval(refreshRatio, 300000);
 
-    fetchPositions(true);  // Initial print
+    await fetchPositions(true);  // Initial Synth print
+    await fetchUserPositions(true);  // New: Initial user print
   });
 
   // Trade filter
