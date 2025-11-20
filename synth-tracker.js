@@ -35,8 +35,10 @@ const API_KEY = process.env.API_KEY;
 const API_SECRET = process.env.API_SECRET;
 const API_PASSPHRASE = process.env.API_PASSPHRASE;
 const SIGNATURE_TYPE = 2;  // 2 for smart contract wallets (EIP-1271)
-const SCALE_FACTOR = 0.5;  // 10% allocation
-const MAX_EXPOSURE = 0.95;  // 20% max per market
+const SCALE_FACTOR = 0.1;  // 10% allocation
+// const SCALE_FACTOR = 0.2;  // 10% allocation
+const MAX_EXPOSURE = 0.2;  // 20% max per market
+// const MAX_EXPOSURE = 0.3;  // 20% max per market
 const MIN_SHARES = 5;  // Min shares to copy (bump if scaled <5 but >0)
 const EPSILON = 0.01;  // For passive limits
 
