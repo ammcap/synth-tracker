@@ -1,5 +1,9 @@
 const { ethers } = require('ethers');
 const axios = require('axios');
+const { ClobClient, Side, OrderType } = require('@polymarket/clob-client');
+const dotenv = require('dotenv');
+
+dotenv.config();
 
 // ANSI colors for terminal
 const colors = {
@@ -23,14 +27,64 @@ const CTF_ADDRESS = '0x4d97dcd97ec945f40cf65f87097ace5ea0476045'.toLowerCase(); 
 const POLYGON_WS_URL = 'wss://polygon-mainnet.g.alchemy.com/v2/PLG7HaKwMvU9g5Ajifosm';  // Keep your key here
 const DATA_API_URL = 'https://data-api.polymarket.com';
 const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
+const CLOB_HOST = 'https://clob.polymarket.com';  // For trading
+const CHAIN_ID = 137;  // Polygon
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS || '';  // If empty, defaults to signer.address
+const API_KEY = process.env.API_KEY;
+const API_SECRET = process.env.API_SECRET;
+const API_PASSPHRASE = process.env.API_PASSPHRASE;
+const SIGNATURE_TYPE = 2;  // 2 for smart contract wallets (EIP-1271)
+const SCALE_FACTOR = 0.1;  // 10% allocation
+const MAX_EXPOSURE = 0.2;  // 20% max per market
+const MIN_SHARES = 5;  // Min shares to copy (bump if scaled <5 but >0)
+const EPSILON = 0.01;  // For passive limits
 
-// USDC ABI for balanceOf
+// USDC ABI for balanceOf and approve
 const USDC_ABI = [
   {
     "inputs": [{"name": "account", "type": "address"}],
     "name": "balanceOf",
     "outputs": [{"name": "", "type": "uint256"}],
     "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}],
+    "name": "approve",
+    "outputs": [{"name": "", "type": "bool"}],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}],
+    "name": "allowance",
+    "outputs": [{"name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function"
+  }
+];
+
+// CTF ABI for splitPosition
+const CTF_ABI = [
+  {
+    "inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
+    "name": "balanceOf",
+    "outputs": [{"name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {"name": "collateralToken", "type": "address"},
+      {"name": "parentCollectionId", "type": "bytes32"},
+      {"name": "conditionId", "type": "bytes32"},
+      {"name": "partition", "type": "uint256[]"},
+      {"name": "amount", "type": "uint256"}
+    ],
+    "name": "splitPosition",
+    "outputs": [],
+    "stateMutability": "nonpayable",
     "type": "function"
   }
 ];
@@ -53,6 +107,8 @@ let prevPositions = [];     // Previous Synth positions for delta calc
 
 // Global provider
 let provider;
+let signer;
+let clobClient;
 
 // Global values
 let synthPositionsValue = 0;
@@ -66,7 +122,7 @@ let initialSynthMarkets = new Set();
 // Set of tracked new markets (post-startup)
 let trackedSynthMarkets = new Set();
 
-// Map for accumulation in tracked markets: marketKey -> outcome -> {netQty: 0, netUsdc: 0}
+// Map for accumulation in tracked markets: marketKey -> outcome -> {netQty: 0, netUsdc: 0, avgPrice: 0}
 let trackedMarketStats = new Map();
 
 // Refresh timeout for debouncing
@@ -113,6 +169,7 @@ async function refreshTotals() {
   userCollateral = await getCollateral(USER_ADDRESS);
   console.log(`${colors.cyan}Synth Positions: $${synthPositionsValue.toFixed(2)} | Collateral: $${synthCollateral.toFixed(2)} | Total: $${(synthPositionsValue + synthCollateral).toFixed(2)}${colors.reset}`);
   console.log(`${colors.cyan}User Positions: $${userPositionsValue.toFixed(2)} | Collateral: $${userCollateral.toFixed(2)} | Total: $${(userPositionsValue + userCollateral).toFixed(2)}${colors.reset}`);
+  await triggerCopies();  // Trigger copy logic after refresh
 }
 
 // Fetch Synth positions (updates value)
@@ -254,7 +311,7 @@ async function resolveConditionId(conditionId) {
         const market = response.data[0];
         const outcomes = JSON.parse(market.outcomes || '[]');
         const tokenIds = JSON.parse(market.clobTokenIds || '[]');
-        return { market: market.question || 'Unknown', outcomes, slug: market.slug || 'Unknown', tokenIds };
+        return { market: market.question || 'Unknown', outcomes, slug: market.slug || 'Unknown', tokenIds, tickSize: market.orderPriceMinTickSize || '0.01', negRisk: market.negRisk === true || market.negRisk === 'true' };
       }
       return null;
     } catch (error) {
@@ -495,12 +552,154 @@ async function handleSplitLog(log) {
   group.splits.push(decoded.args);
 }
 
+// Ensure USDC approvals for CTF and Exchange
+async function ensureApprovals() {
+  const usdcContract = new ethers.Contract(USDC_ADDRESS, USDC_ABI, signer);
+  const allowanceCTF = await usdcContract.allowance(signer.address, CTF_ADDRESS);
+  if (allowanceCTF.lt(ethers.utils.parseUnits('10000', 6))) {  // Approve large amount
+    const tx = await usdcContract.approve(CTF_ADDRESS, ethers.constants.MaxUint256, {
+      maxPriorityFeePerGas: ethers.utils.parseUnits('30', 'gwei'),
+      maxFeePerGas: ethers.utils.parseUnits('200', 'gwei')
+    });
+    await tx.wait();
+    console.log(colors.green + 'Approved USDC for CTF' + colors.reset);
+  }
+  const allowanceExchange = await usdcContract.allowance(signer.address, EXCHANGE_CONTRACT);
+  if (allowanceExchange.lt(ethers.utils.parseUnits('10000', 6))) {
+    const tx = await usdcContract.approve(EXCHANGE_CONTRACT, ethers.constants.MaxUint256, {
+      maxPriorityFeePerGas: ethers.utils.parseUnits('30', 'gwei'),
+      maxFeePerGas: ethers.utils.parseUnits('200', 'gwei')
+    });
+    await tx.wait();
+    console.log(colors.green + 'Approved USDC for Exchange' + colors.reset);
+  }
+}
+
+// Trigger copy trades based on nets
+async function triggerCopies() {
+  for (const [marketKey, outcomeStats] of trackedMarketStats) {
+    // Filter: Only BTC/ETH Up or Down markets
+    if (!marketKey.includes('bitcoin up or down') && !marketKey.includes('ethereum up or down')) continue;
+
+    for (const [outcome, stats] of outcomeStats) {
+      const netQty = Math.abs(stats.netQty);
+      if (netQty < MIN_SHARES) continue;  // Filter min shares
+
+      // Scale size
+      let scaledSize = netQty * (userCollateral * SCALE_FACTOR / synthCollateral);
+      if (scaledSize < MIN_SHARES && scaledSize > 0) scaledSize = MIN_SHARES;
+      scaledSize = Math.floor(scaledSize * 10000) / 10000;  // Precision
+
+      // Check max exposure
+      if (userPositionsValue / userCollateral > MAX_EXPOSURE) {
+        console.log(colors.yellow + `Skipping copy in ${marketKey} (${outcome}): Max exposure reached` + colors.reset);
+        continue;
+      }
+
+      // Resolve market details
+      const marketInfo = await resolveConditionIdFromMarketKey(marketKey);  // New helper, implement below
+      if (!marketInfo) continue;
+
+      const tokenId = marketInfo.tokenIds[marketInfo.outcomes.indexOf(outcome)];
+      const isLong = stats.netQty > 0;
+
+      console.log(colors.bold + colors.magenta + `Copying net ${isLong ? '+' : '-'} ${scaledSize.toFixed(2)} shares of ${outcome} in ${marketKey}` + colors.reset);
+
+      if (isLong) {
+        await placeBuyOrder(tokenId, stats.netUsdc / netQty, scaledSize, marketInfo);  // Avg price from netUsdc/netQty
+      } else {
+        await placeShortOrder(marketInfo.conditionId, tokenId, stats.netUsdc / netQty, scaledSize, marketInfo);
+      }
+    }
+  }
+}
+
+// Helper to resolve conditionId from marketKey (question)
+async function resolveConditionIdFromMarketKey(marketKey) {
+  try {
+    const response = await axios.get(`${GAMMA_API_URL}/markets`, {
+      params: { question: marketKey, limit: 1 }
+    });
+    if (response.data.length > 0) {
+      const market = response.data[0];
+      const outcomes = JSON.parse(market.outcomes || '[]');
+      const tokenIds = JSON.parse(market.clobTokenIds || '[]');
+      return { outcomes, tokenIds, conditionId: market.conditionId, tickSize: market.orderPriceMinTickSize || '0.01', negRisk: market.negRisk === true || market.negRisk === 'true' };
+    }
+    return null;
+  } catch (error) {
+    console.error(colors.red + 'Error resolving market from key:' + colors.reset, error.message);
+    return null;
+  }
+}
+
+// Place buy order
+async function placeBuyOrder(tokenId, avgPrice, size, marketInfo) {
+  try {
+    // Get best ask
+    const priceUrl = `${CLOB_HOST}/price?token_id=${tokenId}&side=sell`;
+    const resp = await axios.get(priceUrl);
+    let bestAsk = parseFloat(resp.data.price);
+    if (isNaN(bestAsk) || bestAsk <= 0) bestAsk = avgPrice;
+
+    const passivePrice = bestAsk - parseFloat(marketInfo.tickSize) - EPSILON;
+
+    const buyParams = {
+      tokenID: tokenId,
+      price: passivePrice,
+      side: Side.BUY,
+      size,
+    };
+    const orderResponse = await clobClient.createAndPostOrder(buyParams, { tickSize: marketInfo.tickSize, negRisk: marketInfo.negRisk }, OrderType.GTC);
+    console.log(colors.green + `Placed BUY order: ${JSON.stringify(orderResponse)}` + colors.reset);
+  } catch (error) {
+    console.error(colors.red + 'Error placing buy:' + colors.reset, error.message);
+  }
+}
+
+// Place short (mint and sell)
+async function placeShortOrder(conditionId, tokenId, avgPrice, size, marketInfo) {
+  try {
+    const ctfContract = new ethers.Contract(CTF_ADDRESS, CTF_ABI, signer);
+    const amountBN = ethers.utils.parseUnits(size.toString(), 6);
+    const tx = await ctfContract.splitPosition(USDC_ADDRESS, ethers.constants.HashZero, conditionId, [1, 2], amountBN, {
+      maxPriorityFeePerGas: ethers.utils.parseUnits('30', 'gwei'),
+      maxFeePerGas: ethers.utils.parseUnits('200', 'gwei')
+    });
+    await tx.wait();
+    console.log(colors.green + `Minted ${size} shares for short` + colors.reset);
+
+    // Get best bid
+    const priceUrl = `${CLOB_HOST}/price?token_id=${tokenId}&side=buy`;
+    const resp = await axios.get(priceUrl);
+    let bestBid = parseFloat(resp.data.price);
+    if (isNaN(bestBid) || bestBid <= 0) bestBid = avgPrice;
+
+    const passivePrice = bestBid + parseFloat(marketInfo.tickSize) + EPSILON;
+
+    const sellParams = {
+      tokenID: tokenId,
+      price: passivePrice,
+      side: Side.SELL,
+      size,
+    };
+    const orderResponse = await clobClient.createAndPostOrder(sellParams, { tickSize: marketInfo.tickSize, negRisk: marketInfo.negRisk }, OrderType.GTC);
+    console.log(colors.green + `Placed SELL order: ${JSON.stringify(orderResponse)}` + colors.reset);
+  } catch (error) {
+    console.error(colors.red + 'Error placing short:' + colors.reset, error.message);
+  }
+}
+
 // Start tracker
 function startTracker() {
   provider = new ethers.providers.WebSocketProvider(POLYGON_WS_URL);
+  signer = new ethers.Wallet(PRIVATE_KEY, provider);
+  clobClient = new ClobClient(CLOB_HOST, CHAIN_ID, signer, { key: API_KEY, secret: API_SECRET, passphrase: API_PASSPHRASE }, SIGNATURE_TYPE, FUNDER_ADDRESS || signer.address);
 
   provider._websocket.on('open', async () => {
     console.log(colors.green + 'Connected to Polygon websocket' + colors.reset);
+
+    await ensureApprovals();  // Ensure approvals on start
 
     // Initial fetches
     await fetchPositions(true);  // Print initial Synth positions
