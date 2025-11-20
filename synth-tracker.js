@@ -35,8 +35,8 @@ const API_KEY = process.env.API_KEY;
 const API_SECRET = process.env.API_SECRET;
 const API_PASSPHRASE = process.env.API_PASSPHRASE;
 const SIGNATURE_TYPE = 2;  // 2 for smart contract wallets (EIP-1271)
-const SCALE_FACTOR = 0.1;  // 10% allocation
-const MAX_EXPOSURE = 0.2;  // 20% max per market
+const SCALE_FACTOR = 0.5;  // 10% allocation
+const MAX_EXPOSURE = 0.95;  // 20% max per market
 const MIN_SHARES = 5;  // Min shares to copy (bump if scaled <5 but >0)
 const EPSILON = 0.01;  // For passive limits
 
@@ -131,6 +131,12 @@ let refreshTimeout;
 // Pending tx groups for atomic processing
 let pendingTxs = new Map();
 
+// Map to cache original case market titles for API queries (key: lowercased, value: original)
+let marketTitleCache = new Map();
+
+// Map to store conditionId for each marketKey (for accurate resolution during copies)
+let marketKeyToConditionId = new Map();
+
 // Function to sleep
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -179,6 +185,12 @@ async function fetchPositions(print = false) {
       params: { user: SYNTH_ADDRESS, limit: 1000 }
     });
     currentPositions = response.data;
+
+    // Cache original market titles (lower as key, original as value)
+    currentPositions.forEach(p => {
+      const lowerTitle = p.title.toLowerCase();
+      marketTitleCache.set(lowerTitle, p.title);
+    });
 
     // Calculate positions value
     const mapped = currentPositions.map(p => {
@@ -420,6 +432,11 @@ async function processTxGroup(txHash) {
       updateTrackedStats(marketKey, outcome, true, amountNum, 0);  // Add qty, usdc 0 (collateral separate)
     }
 
+    // Store conditionId for later resolution
+    if (!marketKeyToConditionId.has(marketKey)) {
+      marketKeyToConditionId.set(marketKey, conditionId);
+    }
+
     // Track market if new
     if (!isInitialMarket && isFirstInMarket) {
       trackedSynthMarkets.add(marketKey);
@@ -444,7 +461,7 @@ async function processTxGroup(txHash) {
     const tokenAmount = makerAssetId.eq(0) ? fill.takerAmountFilled : fill.makerAmountFilled;
     const price = usdcAmount.toNumber() / tokenAmount.toNumber();
 
-    const { market, outcome } = await resolveTokenId(outcomeTokenId);
+    const { market, outcome, slug, conditionId } = await resolveTokenId(outcomeTokenId);
 
     marketKey = market.toLowerCase();
     isInitialMarket = initialSynthMarkets.has(marketKey);
@@ -466,6 +483,11 @@ async function processTxGroup(txHash) {
         trackedSynthMarkets.add(marketKey);
       }
       updateTrackedStats(marketKey, outcome, isBuy, sharesNum, usdcNum);
+    }
+
+    // Store conditionId for later resolution (from fill resolution)
+    if (!marketKeyToConditionId.has(marketKey)) {
+      marketKeyToConditionId.set(marketKey, conditionId);
     }
   }
 
@@ -596,8 +618,13 @@ async function triggerCopies() {
         continue;
       }
 
-      // Resolve market details
-      const marketInfo = await resolveConditionIdFromMarketKey(marketKey);  // New helper, implement below
+      // Resolve market details using stored conditionId
+      const conditionId = marketKeyToConditionId.get(marketKey);
+      if (!conditionId) {
+        console.error(colors.red + `No conditionId stored for market: ${marketKey}. Skipping copy.` + colors.reset);
+        continue;
+      }
+      const marketInfo = await resolveConditionId(conditionId);
       if (!marketInfo) continue;
 
       const tokenId = marketInfo.tokenIds[marketInfo.outcomes.indexOf(outcome)];
@@ -614,32 +641,22 @@ async function triggerCopies() {
   }
 }
 
-// Helper to resolve conditionId from marketKey (question)
-async function resolveConditionIdFromMarketKey(marketKey) {
-  try {
-    const response = await axios.get(`${GAMMA_API_URL}/markets`, {
-      params: { question: marketKey, limit: 1 }
-    });
-    if (response.data.length > 0) {
-      const market = response.data[0];
-      const outcomes = JSON.parse(market.outcomes || '[]');
-      const tokenIds = JSON.parse(market.clobTokenIds || '[]');
-      return { outcomes, tokenIds, conditionId: market.conditionId, tickSize: market.orderPriceMinTickSize || '0.01', negRisk: market.negRisk === true || market.negRisk === 'true' };
-    }
-    return null;
-  } catch (error) {
-    console.error(colors.red + 'Error resolving market from key:' + colors.reset, error.message);
-    return null;
-  }
-}
-
 // Place buy order
 async function placeBuyOrder(tokenId, avgPrice, size, marketInfo) {
   try {
-    // Get best ask
-    const priceUrl = `${CLOB_HOST}/price?token_id=${tokenId}&side=sell`;
-    const resp = await axios.get(priceUrl);
-    let bestAsk = parseFloat(resp.data.price);
+    let bestAsk;
+    try {
+      const priceUrl = `${CLOB_HOST}/price?token_id=${tokenId}&side=sell`;
+      const resp = await axios.get(priceUrl);
+      bestAsk = parseFloat(resp.data.price);
+    } catch (error) {
+      if (error.response && error.response.status === 404) {
+        console.log(colors.yellow + 'No ask price available, falling back to avg price' + colors.reset);
+        bestAsk = avgPrice;
+      } else {
+        throw error;
+      }
+    }
     if (isNaN(bestAsk) || bestAsk <= 0) bestAsk = avgPrice;
 
     const passivePrice = bestAsk - parseFloat(marketInfo.tickSize) - EPSILON;
@@ -650,6 +667,7 @@ async function placeBuyOrder(tokenId, avgPrice, size, marketInfo) {
       side: Side.BUY,
       size,
     };
+    console.log(tokenId, avgPrice, size, marketInfo);
     const orderResponse = await clobClient.createAndPostOrder(buyParams, { tickSize: marketInfo.tickSize, negRisk: marketInfo.negRisk }, OrderType.GTC);
     console.log(colors.green + `Placed BUY order: ${JSON.stringify(orderResponse)}` + colors.reset);
   } catch (error) {
@@ -669,10 +687,19 @@ async function placeShortOrder(conditionId, tokenId, avgPrice, size, marketInfo)
     await tx.wait();
     console.log(colors.green + `Minted ${size} shares for short` + colors.reset);
 
-    // Get best bid
-    const priceUrl = `${CLOB_HOST}/price?token_id=${tokenId}&side=buy`;
-    const resp = await axios.get(priceUrl);
-    let bestBid = parseFloat(resp.data.price);
+    let bestBid;
+    try {
+      const priceUrl = `${CLOB_HOST}/price?token_id=${tokenId}&side=buy`;
+      const resp = await axios.get(priceUrl);
+      bestBid = parseFloat(resp.data.price);
+    } catch (error) {
+      if (error.response && error.response.status === 404) {
+        console.log(colors.yellow + 'No bid price available, falling back to avg price' + colors.reset);
+        bestBid = avgPrice;
+      } else {
+        throw error;
+      }
+    }
     if (isNaN(bestBid) || bestBid <= 0) bestBid = avgPrice;
 
     const passivePrice = bestBid + parseFloat(marketInfo.tickSize) + EPSILON;
