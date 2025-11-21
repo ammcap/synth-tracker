@@ -2,6 +2,8 @@ const { ethers } = require('ethers');
 const axios = require('axios');
 const { ClobClient, Side, OrderType } = require('@polymarket/clob-client');
 const dotenv = require('dotenv');
+const fs = require('fs');
+const path = require('path');
 
 dotenv.config();
 
@@ -137,6 +139,23 @@ let marketTitleCache = new Map();
 // Map to store conditionId for each marketKey (for accurate resolution during copies)
 let marketKeyToConditionId = new Map();
 
+// Logging setup
+let logFilePath;
+
+function initLogging() {
+  const logsDir = path.join(__dirname, 'logs');
+  if (!fs.existsSync(logsDir)) {
+    fs.mkdirSync(logsDir);
+  }
+  const now = new Date().toISOString().replace(/[:\-]/g, '').split('.')[0];
+  logFilePath = path.join(logsDir, `synth-tracker-${now}.log`);
+}
+
+function logEntry(entry) {
+  if (!logFilePath) return;
+  fs.appendFileSync(logFilePath, JSON.stringify(entry) + '\n');
+}
+
 // Function to sleep
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -212,6 +231,23 @@ async function fetchPositions(print = false) {
     mapped.forEach(p => {
       synthPositionsValue += parseFloat(p.value);
     });
+
+    // Log initial positions as a single entry
+    if (print) {  // Assuming print=true for initial fetch
+      const positions = mapped.map(p => ({
+        market: p.market,
+        direction: p.outcome
+      }));
+      logEntry({
+        timestamp: new Date().toISOString(),
+        level: 'info',
+        event_type: 'initial_positions',
+        message: 'Synth initial positions',
+        data: {
+          positions: positions
+        }
+      });
+    }
 
     if (print) {
       console.log(colors.bold + colors.blue + '\n=== SYNTH CURRENT ACTIVE POSITIONS (sorted by value) ===' + colors.reset);
@@ -719,6 +755,7 @@ async function placeShortOrder(conditionId, tokenId, avgPrice, size, marketInfo)
 
 // Start tracker
 function startTracker() {
+  initLogging();  // Initialize logging at startup
   provider = new ethers.providers.WebSocketProvider(POLYGON_WS_URL);
   signer = new ethers.Wallet(PHANTOM_POLYGON_WALLET_PRIVATE_KEY, provider);
   clobClient = new ClobClient(CLOB_HOST, CHAIN_ID, signer, { key: API_KEY, secret: API_SECRET, passphrase: API_PASSPHRASE }, SIGNATURE_TYPE, POLYMARKET_PROXY_ADDRESS_LOWER_CASE || signer.address);
