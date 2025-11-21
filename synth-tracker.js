@@ -19,26 +19,24 @@ const colors = {
 };
 
 // Config
-const SYNTH_ADDRESS = '0x557bed924a1bb6f62842c5742d1dc789b8d480d4'.toLowerCase();
-const USER_ADDRESS = '0x2ddc093099a5722dc017c70e756dd3ea5586951e'.toLowerCase();  // Your wallet address
+const SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE = '0x557bed924a1bb6f62842c5742d1dc789b8d480d4'.toLowerCase(); // Synth's polymarket proxy wallet address (the one we are tracking/copying)
+const POLYMARKET_PROXY_ADDRESS_LOWER_CASE = '0x2ddc093099a5722dc017c70e756dd3ea5586951e'.toLowerCase();  // The user's polymarket proxy wallet address
+const PHANTOM_POLYGON_WALLET_ADDRESS_LOWER_CASE = '0xf37bcCB3e7a4c9999c0D67dc618cDf8CB5C69016'.toLowerCase(); //The user's wallet address that funded the proxy and signs txs
 const EXCHANGE_CONTRACT = '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e'.toLowerCase();
 const USDC_ADDRESS = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'.toLowerCase();  // USDC contract on Polygon
 const CTF_ADDRESS = '0x4d97dcd97ec945f40cf65f87097ace5ea0476045'.toLowerCase();  // ConditionalTokens contract
-const POLYGON_WS_URL = 'wss://polygon-mainnet.g.alchemy.com/v2/PLG7HaKwMvU9g5Ajifosm';  // Keep your key here
+const POLYGON_WS_URL = 'wss://polygon-bor-rpc.publicnode.com';
 const DATA_API_URL = 'https://data-api.polymarket.com';
 const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
 const CLOB_HOST = 'https://clob.polymarket.com';  // For trading
 const CHAIN_ID = 137;  // Polygon
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS || '';  // If empty, defaults to signer.address
+const PHANTOM_POLYGON_WALLET_PRIVATE_KEY = process.env.PHANTOM_POLYGON_WALLET_PRIVATE_KEY;
 const API_KEY = process.env.API_KEY;
 const API_SECRET = process.env.API_SECRET;
 const API_PASSPHRASE = process.env.API_PASSPHRASE;
 const SIGNATURE_TYPE = 2;  // 2 for smart contract wallets (EIP-1271)
 const SCALE_FACTOR = 0.1;  // 10% allocation
-// const SCALE_FACTOR = 0.2;  // 10% allocation
 const MAX_EXPOSURE = 0.2;  // 20% max per market
-// const MAX_EXPOSURE = 0.3;  // 20% max per market
 const MIN_SHARES = 5;  // Min shares to copy (bump if scaled <5 but >0)
 const EPSILON = 0.01;  // For passive limits
 
@@ -173,8 +171,8 @@ async function getCollateral(address) {
 async function refreshTotals() {
   await fetchPositions();
   await fetchUserPositions();
-  synthCollateral = await getCollateral(SYNTH_ADDRESS);
-  userCollateral = await getCollateral(USER_ADDRESS);
+  synthCollateral = await getCollateral(SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE);
+  userCollateral = await getCollateral(POLYMARKET_PROXY_ADDRESS_LOWER_CASE);
   console.log(`${colors.cyan}Synth Positions: $${synthPositionsValue.toFixed(2)} | Collateral: $${synthCollateral.toFixed(2)} | Total: $${(synthPositionsValue + synthCollateral).toFixed(2)}${colors.reset}`);
   console.log(`${colors.cyan}User Positions: $${userPositionsValue.toFixed(2)} | Collateral: $${userCollateral.toFixed(2)} | Total: $${(userPositionsValue + userCollateral).toFixed(2)}${colors.reset}`);
   await triggerCopies();  // Trigger copy logic after refresh
@@ -184,7 +182,7 @@ async function refreshTotals() {
 async function fetchPositions(print = false) {
   try {
     const response = await axios.get(`${DATA_API_URL}/positions`, {
-      params: { user: SYNTH_ADDRESS, limit: 1000 }
+      params: { user: SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE, limit: 1000 }
     });
     currentPositions = response.data;
 
@@ -239,7 +237,7 @@ async function fetchPositions(print = false) {
 async function fetchUserPositions(print = false) {
   try {
     const response = await axios.get(`${DATA_API_URL}/positions`, {
-      params: { user: USER_ADDRESS, limit: 1000 }
+      params: { user: POLYMARKET_PROXY_ADDRESS_LOWER_CASE, limit: 1000 }
     });
     userPositions = response.data;
 
@@ -449,9 +447,9 @@ async function processTxGroup(txHash) {
   for (const fill of group.fills) {
     const maker = fill.maker.toLowerCase();
     const taker = fill.taker.toLowerCase();
-    if (maker !== SYNTH_ADDRESS && taker !== SYNTH_ADDRESS) continue;
+    if (maker !== SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE && taker !== SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE) continue;
 
-    const isSynthMaker = maker === SYNTH_ADDRESS;
+    const isSynthMaker = maker === SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE;
     const makerAssetId = fill.makerAssetId;
     const takerAssetId = fill.takerAssetId;
 
@@ -545,7 +543,7 @@ async function handleTradeLog(log) {
 
   const maker = decoded.args.maker.toLowerCase();
   const taker = decoded.args.taker.toLowerCase();
-  if (maker !== SYNTH_ADDRESS && taker !== SYNTH_ADDRESS) return;
+  if (maker !== SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE && taker !== SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE) return;
 
   const txHash = log.transactionHash;
 
@@ -565,7 +563,7 @@ async function handleSplitLog(log) {
   const decoded = iface.parseLog(log);
 
   const stakeholder = decoded.args.stakeholder.toLowerCase();
-  if (stakeholder !== SYNTH_ADDRESS) return;
+  if (stakeholder !== SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE) return;
 
   const txHash = log.transactionHash;
 
@@ -615,7 +613,7 @@ async function triggerCopies() {
       scaledSize = Math.floor(scaledSize * 10000) / 10000;  // Precision
 
       // Check max exposure
-      if (userPositionsValue / userCollateral > MAX_EXPOSURE) {
+      if (userPositionsValue / (userPositionsValue + userCollateral) > MAX_EXPOSURE) {
         console.log(colors.yellow + `Skipping copy in ${marketKey} (${outcome}): Max exposure reached` + colors.reset);
         continue;
       }
@@ -722,8 +720,8 @@ async function placeShortOrder(conditionId, tokenId, avgPrice, size, marketInfo)
 // Start tracker
 function startTracker() {
   provider = new ethers.providers.WebSocketProvider(POLYGON_WS_URL);
-  signer = new ethers.Wallet(PRIVATE_KEY, provider);
-  clobClient = new ClobClient(CLOB_HOST, CHAIN_ID, signer, { key: API_KEY, secret: API_SECRET, passphrase: API_PASSPHRASE }, SIGNATURE_TYPE, FUNDER_ADDRESS || signer.address);
+  signer = new ethers.Wallet(PHANTOM_POLYGON_WALLET_PRIVATE_KEY, provider);
+  clobClient = new ClobClient(CLOB_HOST, CHAIN_ID, signer, { key: API_KEY, secret: API_SECRET, passphrase: API_PASSPHRASE }, SIGNATURE_TYPE, POLYMARKET_PROXY_ADDRESS_LOWER_CASE || signer.address);
 
   provider._websocket.on('open', async () => {
     console.log(colors.green + 'Connected to Polygon websocket' + colors.reset);
@@ -761,4 +759,4 @@ function startTracker() {
 }
 
 startTracker();
-console.log(colors.bold + 'Synth Tracker Bot Running... Monitoring address:' + colors.reset, SYNTH_ADDRESS);
+console.log(colors.bold + 'Synth Tracker Bot Running... Monitoring address:' + colors.reset, SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE);
