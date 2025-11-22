@@ -21,7 +21,7 @@ const colors = {
 };
 
 // Config
-const SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE = '0x557bed924a1bb6f62842c5742d1dc789b8d480d4'.toLowerCase(); // Synth's polymarket proxy wallet address (the one we are tracking/copying)
+const SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE = '0x557bed924a1bb6f62842c5742d1dc789b8d480d4'.toLowerCase(); // Synth's polymarket proxy wallet address
 const POLYMARKET_PROXY_ADDRESS_LOWER_CASE = '0x2ddc093099a5722dc017c70e756dd3ea5586951e'.toLowerCase();  // The user's polymarket proxy wallet address
 const PHANTOM_POLYGON_WALLET_ADDRESS_LOWER_CASE = '0xf37bcCB3e7a4c9999c0D67dc618cDf8CB5C69016'.toLowerCase(); //The user's wallet address that funded the proxy and signs txs
 const EXCHANGE_CONTRACT = '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e'.toLowerCase();
@@ -37,10 +37,14 @@ const API_KEY = process.env.API_KEY;
 const API_SECRET = process.env.API_SECRET;
 const API_PASSPHRASE = process.env.API_PASSPHRASE;
 const SIGNATURE_TYPE = 2;  // 2 for smart contract wallets (EIP-1271)
-const SCALE_FACTOR = 0.1;  // 10% allocation
-const MAX_EXPOSURE = 0.2;  // 20% max per market
-const MIN_SHARES = 5;  // Min shares to copy (bump if scaled <5 but >0)
+
+// Strategy Config
+const SCALE_FACTOR = 0.1;  // 10% allocation relative to Synth
+const MAX_EXPOSURE = 0.95;  // 95% max total account exposure (allows using sidelined cash)
+const MAX_SINGLE_MARKET_PERCENT = 0.25; // Max 25% of account per single market (saves funds for other timeframes)
+const MIN_SHARES = 5;  // Min shares to copy
 const EPSILON = 0.01;  // For passive limits
+const REDEEM_INTERVAL_MS = 1 * 60 * 1000; // Check for winnings every 1 minute (More frequent to clear dust)
 
 // USDC ABI for balanceOf and approve
 const USDC_ABI = [
@@ -67,7 +71,7 @@ const USDC_ABI = [
   }
 ];
 
-// CTF ABI for splitPosition
+// CTF ABI for splitPosition AND redeemPositions
 const CTF_ABI = [
   {
     "inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
@@ -87,6 +91,40 @@ const CTF_ABI = [
     "name": "splitPosition",
     "outputs": [],
     "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      { "name": "collateralToken", "type": "address" },
+      { "name": "parentCollectionId", "type": "bytes32" },
+      { "name": "conditionId", "type": "bytes32" },
+      { "name": "indexSets", "type": "uint256[]" } 
+    ],
+    "name": "redeemPositions",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+];
+
+// Gnosis Safe Proxy ABI (For executing Redemptions)
+const PROXY_ABI = [
+  {
+    "inputs": [
+      { "internalType": "address", "name": "to", "type": "address" },
+      { "internalType": "uint256", "name": "value", "type": "uint256" },
+      { "internalType": "bytes", "name": "data", "type": "bytes" },
+      { "internalType": "enum Enum.Operation", "name": "operation", "type": "uint8" },
+      { "internalType": "uint256", "name": "safeTxGas", "type": "uint256" },
+      { "internalType": "uint256", "name": "baseGas", "type": "uint256" },
+      { "internalType": "uint256", "name": "gasPrice", "type": "uint256" },
+      { "internalType": "address", "name": "gasToken", "type": "address" },
+      { "internalType": "address payable", "name": "refundReceiver", "type": "address" },
+      { "internalType": "bytes", "name": "signatures", "type": "bytes" }
+    ],
+    "name": "execTransaction",
+    "outputs": [{ "internalType": "bool", "name": "success", "type": "bool" }],
+    "stateMutability": "payable",
     "type": "function"
   }
 ];
@@ -250,15 +288,13 @@ async function fetchPositions(print = false) {
     }
 
     if (print) {
-      console.log(colors.bold + colors.blue + '\n=== SYNTH CURRENT ACTIVE POSITIONS (sorted by value) ===' + colors.reset);
-      console.log(colors.bold + `Synth Active Positions Total Value: $${synthPositionsValue.toFixed(2)}` + colors.reset);
+      console.log(colors.bold + colors.blue + '\n=== SYNTH CURRENT ACTIVE POSITIONS ===' + colors.reset);
       if (mapped.length === 0) {
         console.log(colors.gray + 'No active positions currently.' + colors.reset);
       } else {
         mapped.forEach((p, index) => {
           console.log(colors.cyan + `Position ${index + 1}:` + colors.reset + ` ${p.market} (${p.outcome})`);
-          console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg Price:${colors.reset} $${p.avgPrice}`);
-          console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice}`);
+          console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg:${colors.reset} $${p.avgPrice}`);
           console.log(colors.gray + '─'.repeat(80) + colors.reset);
         });
       }
@@ -269,13 +305,16 @@ async function fetchPositions(print = false) {
   }
 }
 
-// Fetch user positions
+// Fetch user positions (Keeps "Dust Filter" for LOGS only, so your console stays clean)
 async function fetchUserPositions(print = false) {
   try {
     const response = await axios.get(`${DATA_API_URL}/positions`, {
       params: { user: POLYMARKET_PROXY_ADDRESS_LOWER_CASE, limit: 1000 }
     });
-    userPositions = response.data;
+    
+    // FILTER: Remove "dust" (< $0.01 value) from LOGS/DISPLAY.
+    // NOTE: This does NOT affect redemption. Redemption fetches its own list.
+    userPositions = response.data.filter(p => parseFloat(p.currentValue) > 0.01);
 
     // Calculate positions value
     const mapped = userPositions.map(p => {
@@ -299,15 +338,13 @@ async function fetchUserPositions(print = false) {
     });
 
     if (print) {
-      console.log(colors.bold + colors.blue + '\n=== USER CURRENT ACTIVE POSITIONS (sorted by value) ===' + colors.reset);
-      console.log(colors.bold + `User Active Positions Total Value: $${userPositionsValue.toFixed(2)}` + colors.reset);
+      console.log(colors.bold + colors.blue + '\n=== USER CURRENT ACTIVE POSITIONS (Filtered Dust) ===' + colors.reset);
       if (mapped.length === 0) {
         console.log(colors.gray + 'No active positions currently.' + colors.reset);
       } else {
         mapped.forEach((p, index) => {
           console.log(colors.cyan + `Position ${index + 1}:` + colors.reset + ` ${p.market} (${p.outcome})`);
-          console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg Price:${colors.reset} $${p.avgPrice}`);
-          console.log(`${colors.magenta}Curr Price:${colors.reset} $${p.currentPrice}`);
+          console.log(`${colors.magenta}Qty:${colors.reset} ${p.quantity} | ${colors.magenta}Value:${colors.reset} $${p.value} | ${colors.magenta}Avg:${colors.reset} $${p.avgPrice}`);
           console.log(colors.gray + '─'.repeat(80) + colors.reset);
         });
       }
@@ -317,6 +354,112 @@ async function fetchUserPositions(print = false) {
     console.error(colors.red + 'Error fetching user positions:' + colors.reset, error.message);
   }
 }
+
+// --- UPDATED: AUTOMATED REDEMPTION LOGIC (CLEARS EVERYTHING) ---
+async function checkAndRedeem() {
+  console.log(colors.gray + `\n[Auto-Redeem] Checking for resolved positions to clear (Winners & Losers)...` + colors.reset);
+  
+  let allPositions = [];
+  try {
+    // We fetch ALL positions here with NO VALUE FILTER to ensure we catch dust and dead tickets
+    const response = await axios.get(`${DATA_API_URL}/positions`, {
+      params: { user: POLYMARKET_PROXY_ADDRESS_LOWER_CASE, limit: 1000 }
+    });
+    allPositions = response.data.filter(p => parseFloat(p.size) > 0);
+  } catch (error) {
+    console.error(colors.red + '[Auto-Redeem] Error fetching positions:' + colors.reset, error.message);
+    return;
+  }
+
+  const proxyContract = new ethers.Contract(POLYMARKET_PROXY_ADDRESS_LOWER_CASE, PROXY_ABI, signer);
+  const ctfInterface = new ethers.utils.Interface(CTF_ABI);
+  let redeemedCount = 0;
+
+  for (const position of allPositions) {
+    // 1. Get Market Details
+    let market = null;
+    try {
+        const assetId = position.asset; 
+        const gammaResp = await axios.get(`${GAMMA_API_URL}/markets`, { params: { clob_token_ids: assetId } });
+        if (gammaResp.data.length > 0) market = gammaResp.data[0];
+    } catch (e) { continue; }
+
+    if (!market) continue;
+
+    // 2. Check Resolution Status
+    const isClosed = market.closed === true;
+    const isUmaResolved = market.umaResolutionStatus === "resolved";
+    
+    let outcomePrices = [];
+    try { outcomePrices = JSON.parse(market.outcomePrices); } catch (e) { outcomePrices = []; }
+
+    // We consider it redeemable if it is fully resolved
+    const hasWinnerPrice = outcomePrices.includes("1") || outcomePrices.includes(1);
+
+    // STRICT CHECK: Market MUST be resolved to avoid redeeming active bets
+    if (!isClosed && !isUmaResolved && !hasWinnerPrice) continue;
+
+    // 3. Identify Index to Redeem
+    let outcomes;
+    try { outcomes = JSON.parse(market.outcomes); } catch (e) { outcomes = market.outcomes; }
+
+    const heldIndex = outcomes.indexOf(position.outcome);
+    if (heldIndex === -1) continue;
+
+    // --- UPDATED LOGIC: REDEEM EVERYTHING ---
+    // We no longer check if it is a "Winner". If the market is resolved, we redeem to clean the UI.
+    const size = parseFloat(position.size);
+    
+    console.log(colors.green + `[Auto-Redeem] Found Resolved Position: ${position.title} (${position.outcome}) - Clearing ${size} shares...` + colors.reset);
+    
+    try {
+        console.log(colors.yellow + `   >>> Sending Cleanup/Redemption Tx...` + colors.reset);
+        
+        const indexSet = 1 << heldIndex; 
+        
+        // Encode Inner Call
+        const innerData = ctfInterface.encodeFunctionData("redeemPositions", [
+            USDC_ADDRESS,
+            ethers.constants.HashZero, 
+            market.conditionId,
+            [indexSet]
+        ]);
+
+        // Generate Signature
+        const signature = ethers.utils.solidityPack(
+            ["uint256", "uint256", "uint8"],
+            [signer.address, 0, 1]
+        );
+
+        // Execute on Proxy
+        const tx = await proxyContract.execTransaction(
+            CTF_ADDRESS, 0, innerData, 0, 0, 0, 0,
+            ethers.constants.AddressZero, ethers.constants.AddressZero,
+            signature,
+            {
+                  gasLimit: 500000, 
+                  maxPriorityFeePerGas: ethers.utils.parseUnits('35', 'gwei'),
+                  maxFeePerGas: ethers.utils.parseUnits('300', 'gwei')
+            }
+        );
+
+        console.log(colors.cyan + `   Tx Sent: ${tx.hash}` + colors.reset);
+        await tx.wait();
+        console.log(colors.green + `   Confirmed! Position cleared.` + colors.reset);
+        redeemedCount++;
+    } catch (err) {
+        console.error(colors.red + `   Redemption Failed:` + colors.reset, err.message);
+    }
+  }
+
+  if (redeemedCount > 0) {
+    console.log(colors.green + `[Auto-Redeem] Cycle complete. Cleared ${redeemedCount} positions.` + colors.reset);
+    await refreshTotals(); // Refresh balance after claiming
+  } else {
+    console.log(colors.gray + `[Auto-Redeem] No resolved positions found to clear.` + colors.reset);
+  }
+}
+// ---------------------------------------
 
 // Resolve tokenId → market/outcome
 async function resolveTokenId(tokenId) {
@@ -635,20 +778,45 @@ async function ensureApprovals() {
 
 // Trigger copy trades based on nets
 async function triggerCopies() {
-  for (const [marketKey, outcomeStats] of trackedMarketStats) {
-    // Filter: Only BTC/ETH Up or Down markets
-    if (!marketKey.includes('bitcoin up or down') && !marketKey.includes('ethereum up or down')) continue;
+  // NEW: Virtual Collateral Tracking to prevent loop latency overspending
+  let runningCollateral = userCollateral;
 
+  for (const [marketKey, outcomeStats] of trackedMarketStats) {
+    
     for (const [outcome, stats] of outcomeStats) {
       const netQty = Math.abs(stats.netQty);
       if (netQty < MIN_SHARES) continue;  // Filter min shares
 
-      // Scale size
-      let scaledSize = netQty * (userCollateral * SCALE_FACTOR / synthCollateral);
+      // NEW: Calculate size based on RUNNING collateral
+      // If we have exhausted funds in this loop, stop trying to buy
+      if (runningCollateral <= 0) {
+         console.log(colors.yellow + `Skipping copy in ${marketKey}: Virtual collateral exhausted` + colors.reset);
+         continue; 
+      }
+
+      let scaledSize = netQty * (runningCollateral * SCALE_FACTOR / synthCollateral);
+      
+      // NEW: Safety Cap - Ensure we don't bet more than MAX_SINGLE_MARKET_PERCENT of total available
+      const maxSpendPerMarket = userCollateral * MAX_SINGLE_MARKET_PERCENT;
+      
+      // --- BUG FIX START ---
+      // We must use Math.abs() because netUsdc is negative for buys (money spent)
+      // If netUsdc is 0 (e.g. pure mint), default to 0.50 to prevent division by zero
+      const safeNetUsdc = Math.abs(stats.netUsdc);
+      const estimatedPrice = (safeNetUsdc / netQty) || 0.5; 
+      // --- BUG FIX END ---
+
+      const maxShares = maxSpendPerMarket / estimatedPrice;
+      
+      if (scaledSize > maxShares) {
+        console.log(colors.yellow + `Capping trade size for ${marketKey} (${outcome}) to ${maxShares.toFixed(2)} shares (Safety Cap)` + colors.reset);
+        scaledSize = maxShares;
+      }
+
       if (scaledSize < MIN_SHARES && scaledSize > 0) scaledSize = MIN_SHARES;
       scaledSize = Math.floor(scaledSize * 10000) / 10000;  // Precision
 
-      // Check max exposure
+      // Check max exposure (updated logic for high exposure tolerance)
       if (userPositionsValue / (userPositionsValue + userCollateral) > MAX_EXPOSURE) {
         console.log(colors.yellow + `Skipping copy in ${marketKey} (${outcome}): Max exposure reached` + colors.reset);
         continue;
@@ -668,10 +836,14 @@ async function triggerCopies() {
 
       console.log(colors.bold + colors.magenta + `Copying net ${isLong ? '+' : '-'} ${scaledSize.toFixed(2)} shares of ${outcome} in ${marketKey}` + colors.reset);
 
+      // NEW: Deduct estimated cost from running collateral immediately
+      const approxCost = scaledSize * estimatedPrice; 
+      runningCollateral -= approxCost;
+
       if (isLong) {
-        await placeBuyOrder(tokenId, stats.netUsdc / netQty, scaledSize, marketInfo);  // Avg price from netUsdc/netQty
+        await placeBuyOrder(tokenId, estimatedPrice, scaledSize, marketInfo); 
       } else {
-        await placeShortOrder(marketInfo.conditionId, tokenId, stats.netUsdc / netQty, scaledSize, marketInfo);
+        await placeShortOrder(marketInfo.conditionId, tokenId, estimatedPrice, scaledSize, marketInfo);
       }
     }
   }
@@ -695,17 +867,20 @@ async function placeBuyOrder(tokenId, avgPrice, size, marketInfo) {
     }
     if (isNaN(bestAsk) || bestAsk <= 0) bestAsk = avgPrice;
 
-    const passivePrice = bestAsk - parseFloat(marketInfo.tickSize) - EPSILON;
+    // NEW: Aggressive Pricing (Taker)
+    let aggressivePrice = bestAsk + parseFloat(marketInfo.tickSize);
+    // Cap at 0.99 to prevent invalid order prices
+    if (aggressivePrice >= 1) aggressivePrice = 0.99;
 
     const buyParams = {
       tokenID: tokenId,
-      price: passivePrice,
+      price: aggressivePrice, // Aggressive entry
       side: Side.BUY,
       size,
     };
     console.log(tokenId, avgPrice, size, marketInfo);
     const orderResponse = await clobClient.createAndPostOrder(buyParams, { tickSize: marketInfo.tickSize, negRisk: marketInfo.negRisk }, OrderType.GTC);
-    console.log(colors.green + `Placed BUY order: ${JSON.stringify(orderResponse)}` + colors.reset);
+    console.log(colors.green + `Placed BUY order (Aggressive): ${JSON.stringify(orderResponse)}` + colors.reset);
   } catch (error) {
     console.error(colors.red + 'Error placing buy:' + colors.reset, error.message);
   }
@@ -738,16 +913,19 @@ async function placeShortOrder(conditionId, tokenId, avgPrice, size, marketInfo)
     }
     if (isNaN(bestBid) || bestBid <= 0) bestBid = avgPrice;
 
-    const passivePrice = bestBid + parseFloat(marketInfo.tickSize) + EPSILON;
+    // NEW: Aggressive Pricing (Sell into Bid)
+    let aggressivePrice = bestBid - parseFloat(marketInfo.tickSize);
+    // Floor at 0.01 to prevent invalid order prices
+    if (aggressivePrice <= 0) aggressivePrice = 0.01;
 
     const sellParams = {
       tokenID: tokenId,
-      price: passivePrice,
+      price: aggressivePrice, // Aggressive exit
       side: Side.SELL,
       size,
     };
     const orderResponse = await clobClient.createAndPostOrder(sellParams, { tickSize: marketInfo.tickSize, negRisk: marketInfo.negRisk }, OrderType.GTC);
-    console.log(colors.green + `Placed SELL order: ${JSON.stringify(orderResponse)}` + colors.reset);
+    console.log(colors.green + `Placed SELL order (Aggressive): ${JSON.stringify(orderResponse)}` + colors.reset);
   } catch (error) {
     console.error(colors.red + 'Error placing short:' + colors.reset, error.message);
   }
@@ -770,8 +948,13 @@ function startTracker() {
     // Initialize initial markets only once, from startup positions
     currentPositions.forEach(p => initialSynthMarkets.add(p.title.toLowerCase()));
     prevPositions = JSON.parse(JSON.stringify(currentPositions));
+    
     await fetchUserPositions(true);  // Print initial User positions
     await refreshTotals();  // Initial totals
+    
+    // Run Redemption Check Immediately and Schedule
+    await checkAndRedeem();
+    setInterval(checkAndRedeem, REDEEM_INTERVAL_MS);
 
     console.log(colors.bold + colors.yellow + `Initialized with ${initialSynthMarkets.size} initial markets. Waiting for new trades...` + colors.reset);
   });
