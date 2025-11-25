@@ -45,9 +45,9 @@ const NEG_RISK_EXCHANGE = '0xC5d563A36AE78145C45a50134d48A1215220f80a'.toLowerCa
 
 const SLIPPAGE_BUFFER = 0.03;
 const EXECUTION_THRESHOLD = 5;
-const MAX_POSITION_USD = 500;
-const POLL_INTERVAL_MS = 60000;
+const POLL_INTERVAL_MS = 120000;
 const REDEEM_INTERVAL_MS = 60000;
+const RECONCILE_INTERVAL_MS = 45000;
 
 const ORDER_FILLED_TOPIC = ethers.utils.keccak256(ethers.utils.toUtf8Bytes('OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)'));
 
@@ -130,38 +130,66 @@ class ShadowPortfolio {
     }
 
     async execute(tokenId, sizeToFill, avgEntryPrice, market) {
-        // Safety Check
-        const estimatedCost = Math.abs(sizeToFill) * avgEntryPrice;
-        if (estimatedCost > MAX_POSITION_USD) {
-            console.log(colors.red + `[SKIP] Order size $${estimatedCost.toFixed(2)} exceeds max safety limit.` + colors.reset);
-            return;
-        }
-
         const side = sizeToFill > 0 ? Side.BUY : Side.SELL;
+        let finalSize = Math.abs(sizeToFill);
+
+        // [UPDATE] Dynamic Wallet Balance Check
+        if (side === Side.BUY) {
+            const estimatedCost = finalSize * avgEntryPrice;
+
+            // Check if we can afford this trade
+            if (estimatedCost > userCollateral) {
+                console.log(colors.yellow + `[ADJUST] Target cost $${estimatedCost.toFixed(2)} exceeds wallet balance $${userCollateral.toFixed(2)}.` + colors.reset);
+
+                // Recalculate max shares we can buy with available funds (leaving 1% buffer for rounding)
+                const affordableSize = (userCollateral * 0.99) / avgEntryPrice;
+
+                if (affordableSize < 1) {
+                    console.log(colors.red + `[SKIP] Available funds ($${userCollateral.toFixed(2)}) too low for minimum trade.` + colors.reset);
+                    return;
+                }
+
+                console.log(colors.yellow + `[ADJUST] Resizing order from ${finalSize.toFixed(1)} -> ${affordableSize.toFixed(1)} shares.` + colors.reset);
+                finalSize = affordableSize;
+            }
+        }
 
         // [FIX] HARD SELL CHECK
         // If we are trying to SELL, check if we actually have the shares.
-        // If we don't, we skip. This prevents "not enough balance" errors.
         if (side === Side.SELL) {
             const owned = myOnChainPositions.get(tokenId) || 0;
             if (owned < 0.1) {
-                console.log(colors.red + `[SKIP SELL] Shadow wants to sell ${sizeToFill}, but on-chain balance is ${owned}. Ignoring.` + colors.reset);
+                console.log(colors.red + `[SKIP SELL] Shadow wants to sell ${finalSize}, but on-chain balance is ${owned}. Ignoring.` + colors.reset);
                 return;
+            }
+            // If we try to sell more than we own (drift error), cap it to what we own
+            if (finalSize > owned) {
+                console.log(colors.yellow + `[ADJUST] Cap sell size from ${finalSize} to owned balance ${owned}.` + colors.reset);
+                finalSize = owned;
             }
         }
 
         let limitPrice = sizeToFill > 0 ? (avgEntryPrice + SLIPPAGE_BUFFER) : (avgEntryPrice - SLIPPAGE_BUFFER);
         limitPrice = Math.min(Math.max(limitPrice, 0.05), 0.95);
 
-        // [FIX] Removed Optimistic Update
-        // We only update our local map if the order actually succeeds.
         try {
-            await placeOrder(tokenId, limitPrice, Math.abs(sizeToFill), side, market);
-            // SUCCESS: Now update local state
+            // Use finalSize instead of sizeToFill
+            await placeOrder(tokenId, limitPrice, finalSize, side, market);
+
+            // SUCCESS: Update local state to reflect what we actually did
             const current = myOnChainPositions.get(tokenId) || 0;
-            myOnChainPositions.set(tokenId, current + sizeToFill);
+            const signedChange = side === Side.BUY ? finalSize : -finalSize;
+            myOnChainPositions.set(tokenId, current + signedChange);
+
+            // Update collateral estimate locally so we don't try to double-spend before the next API refresh
+            if (side === Side.BUY) {
+                userCollateral -= (finalSize * limitPrice);
+            } else {
+                userCollateral += (finalSize * limitPrice);
+            }
+
         } catch (e) {
-            // Failure is logged in placeOrder, no state change needed.
+            // Failure is logged in placeOrder
         }
     }
 }
@@ -195,20 +223,46 @@ function parseAndCacheMarket(m) {
     return m;
 }
 
-async function updateMarketCache() {
+async function scanUpcomingMarkets() {
+    console.log(colors.cyan + "[Scanner] Pre-fetching upcoming Bitcoin & Ethereum markets..." + colors.reset);
     try {
-        const tags = ['bitcoin', 'ethereum', 'solana'];
+        // Specific queries to target Synth's markets
+        const queries = [
+            'Bitcoin Up or Down',
+            'Ethereum Up or Down'
+        ];
+
+        // Run requests in parallel for speed
+        const requests = queries.map(q =>
+            axios.get(`${GAMMA_API_URL}/markets`, {
+                params: {
+                    q: q,           // Text search
+                    closed: false,  // Only open markets
+                    active: true,   // Active markets (even if start date is in future)
+                    limit: 50       // Grab a wide batch to catch 15m, 30m, 1h, 4h
+                }
+            })
+        );
+
+        const responses = await Promise.all(requests);
         let newCount = 0;
-        for (const tag of tags) {
-            const resp = await axios.get(`${GAMMA_API_URL}/markets`, {
-                params: { closed: false, active: true, tag_slug: tag, limit: 100 }
-            });
-            for (const m of resp.data) {
-                if (parseAndCacheMarket(m)) newCount++;
+
+        for (const resp of responses) {
+            if (resp.data && Array.isArray(resp.data)) {
+                for (const m of resp.data) {
+                    if (parseAndCacheMarket(m)) newCount++;
+                }
             }
         }
+
+        if (newCount > 0) {
+            console.log(colors.green + `[Scanner] Successfully pre-cached ${newCount} new markets.` + colors.reset);
+        } else {
+            console.log(colors.gray + `[Scanner] No new markets found this cycle.` + colors.reset);
+        }
+
     } catch (e) {
-        console.error("Cache Update Failed:", e.message);
+        console.error(colors.red + "[Scanner Error] Failed to fetch upcoming markets: " + e.message + colors.reset);
     }
 }
 
@@ -446,6 +500,73 @@ async function checkAndRedeem() {
     }
 }
 
+// [NEW] Truth Loop: Fixes State Drift between WebSocket and Reality
+async function reconcileShadowPortfolio() {
+    // console.log(colors.gray + "[Truth Loop] Checking for state drift..." + colors.reset);
+    try {
+        // 1. Fetch Synth's Current Reality
+        const response = await axios.get(`${DATA_API_URL}/positions`, {
+            params: { user: SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE }
+        });
+
+        // Filter out dust (< 0.1 shares)
+        const synthActualPositions = response.data.filter(p => parseFloat(p.size) > 0.1);
+        const synthMap = new Map(); // Keep track of what Synth currently holds
+
+        // 2. Sync Reality -> Shadow
+        for (const p of synthActualPositions) {
+            const tokenId = p.asset;
+            const realSize = parseFloat(p.size);
+            synthMap.set(tokenId, realSize);
+
+            // STRICTLY IGNORE BLACKLISTED MARKETS
+            if (initialSynthMarkets.has(tokenId)) continue;
+
+            // Ensure we have market data
+            let market = marketCache.get(tokenId);
+            if (!market) market = await fetchMarketByTokenId(tokenId);
+            if (!market) continue;
+
+            // Calculate Drift
+            const shadowPos = shadowPortfolio.positions.get(tokenId);
+            const currentShadowSize = shadowPos ? shadowPos.netShares : 0;
+            const delta = realSize - currentShadowSize;
+
+            // If drift exceeds threshold, force correct it
+            if (Math.abs(delta) > EXECUTION_THRESHOLD) {
+                console.log(colors.magenta + `[Reconcile] Drift detected on ${market.outcomeLabel}. Shadow: ${currentShadowSize.toFixed(1)} -> Real: ${realSize.toFixed(1)}` + colors.reset);
+
+                // If we are catching up a BUY (delta > 0), we use a high price (0.95) for the update.
+                // This ensures the subsequent 'execute' logic sets a high enough limit price to actually enter.
+                // If we are SELLING (delta < 0), the price param is ignored by the logic anyway.
+                const catchUpPrice = delta > 0 ? 0.95 : 0;
+
+                // This updates the shadow state AND triggers 'checkTrigger', which forces the bot to trade
+                shadowPortfolio.update(tokenId, delta, catchUpPrice, market);
+            }
+        }
+
+        // 3. Kill Ghosts (Positions Shadow thinks we have, but Synth has sold)
+        for (const [tokenId, shadow] of shadowPortfolio.positions) {
+            // If shadow thinks we have shares (> 0.1) AND Synth does NOT have this token anymore
+            if (shadow.netShares > 0.1 && !synthMap.has(tokenId)) {
+
+                // Double check blacklist to be safe (shouldn't happen, but safety first)
+                if (initialSynthMarkets.has(tokenId)) continue;
+
+                console.log(colors.magenta + `[Reconcile] Ghost position detected on ${shadow.market.outcomeLabel}. Force closing.` + colors.reset);
+
+                // Create a negative delta exactly equal to current shares to zero it out
+                const delta = -shadow.netShares;
+                shadowPortfolio.update(tokenId, delta, 0, shadow.market);
+            }
+        }
+
+    } catch (e) {
+        console.error(colors.red + `[Reconcile Error] ${e.message}` + colors.reset);
+    }
+}
+
 async function startTracker() {
     initLogging();
     console.log(colors.green + "Initializing Synth Tracker (FINAL FIXED VERSION)..." + colors.reset);
@@ -476,11 +597,15 @@ async function startTracker() {
     }
 
     connectWs();
-    await updateMarketCache();
+    await scanUpcomingMarkets();
     await fetchSynthPositions();
     await fetchMyPositions();
     await refreshTotals();
-    setInterval(updateMarketCache, POLL_INTERVAL_MS);
+
+    setInterval(reconcileShadowPortfolio, RECONCILE_INTERVAL_MS);
+
+    setInterval(checkAndRedeem, REDEEM_INTERVAL_MS);
+    setInterval(scanUpcomingMarkets, POLL_INTERVAL_MS);
     setInterval(refreshTotals, 60000);
     setInterval(fetchMyPositions, 120000);
 }
