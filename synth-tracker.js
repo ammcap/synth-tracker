@@ -498,17 +498,24 @@ async function placeOrder(tokenId, price, size, side, marketInfo) {
 
         const order = await clobClient.createAndPostOrder(orderParams, { tickSize: marketInfo.tickSize, negRisk: marketInfo.negRisk });
 
-        if (order && order.orderID) {
-            console.log(colors.green + `[SUCCESS] Order ID: ${order.orderID}` + colors.reset);
+        // [DEBUGGING CHANGE] Log the raw response so we can see what is happening
+        if (!order || !order.orderID) {
+            console.log(colors.red + `[DEBUG] API Response weirdness: ${JSON.stringify(order)}` + colors.reset);
+            logJson('DEBUG_RAW_API', order); // Optional: Log to file
+        }
 
-            // [LOGGING] Log success
+        if (order && (order.orderID || order.orderIds)) {
+            const id = order.orderID || (order.orderIds ? order.orderIds[0] : 'unknown');
+            console.log(colors.green + `[SUCCESS] Order ID: ${id}` + colors.reset);
+
             logJson('EXECUTION_SUCCESS', {
-                orderID: order.orderID,
+                orderID: id,
                 market: marketInfo.outcomeLabel
             });
         } else {
-            console.log(colors.red + `[FAILURE] API returned success but no Order ID. Raw: ${JSON.stringify(order)}` + colors.reset);
-            throw new Error("API returned no Order ID");
+            // This logs the actual reason why it failed instead of just "No Order ID"
+            console.log(colors.red + `[FAILURE] API Raw Response: ${JSON.stringify(order)}` + colors.reset);
+            throw new Error(`API returned no Order ID. Response: ${JSON.stringify(order)}`);
         }
     } catch (e) {
         console.error(colors.red + `[ORDER FAILED] ${e.message}` + colors.reset);
