@@ -76,8 +76,18 @@ let synthTotalEquity = 20000;
 let marketCache = new Map();
 let activeConditions = new Set();
 let initialSynthMarkets = new Set();
-let logFilePath;
+let logStream;
 let myOnChainPositions = new Map();
+
+function logJson(type, data) {
+    if (!logStream) return;
+    const entry = JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: type,
+        ...data
+    });
+    logStream.write(entry + '\n');
+}
 
 // --- SHADOW PORTFOLIO ---
 class ShadowPortfolio {
@@ -116,11 +126,25 @@ class ShadowPortfolio {
         const scaleRatio = effectiveUserEquity / synthTotalEquity;
         const targetSize = shadow.netShares * scaleRatio;
 
-        // [IMPORTANT] Compare against what we actually own on chain
         const currentSize = myOnChainPositions.get(tokenId) || 0;
         const diff = targetSize - currentSize;
+        const absDiff = Math.abs(diff);
 
-        if (Math.abs(diff) < EXECUTION_THRESHOLD) {
+        // [LOGGING] Capture the state of the brain
+        const decision = absDiff < EXECUTION_THRESHOLD ? "ACCUMULATING" : "TRIGGER";
+
+        logJson('BRAIN', {
+            market: shadow.market.outcomeLabel,
+            tokenId: tokenId,
+            synthShares: shadow.netShares,
+            myTarget: targetSize,
+            myActual: currentSize,
+            diff: diff,
+            threshold: EXECUTION_THRESHOLD,
+            decision: decision
+        });
+
+        if (absDiff < EXECUTION_THRESHOLD) {
             console.log(colors.gray + `[Accumulating] ${shadow.market.outcomeLabel}: ShadowTarget=${targetSize.toFixed(1)} | Actual=${currentSize.toFixed(1)} | Diff=${diff.toFixed(2)}` + colors.reset);
             return;
         }
@@ -198,8 +222,13 @@ const shadowPortfolio = new ShadowPortfolio();
 function initLogging() {
     const logsDir = path.join(__dirname, 'logs');
     if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir);
-    const now = new Date().toISOString().replace(/[:\-]/g, '').split('.')[0];
-    logFilePath = path.join(logsDir, `synth-tracker-${now}.log`);
+
+    // Create a flight recorder file
+    const now = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = path.join(logsDir, `flight_recorder_${now}.jsonl`);
+
+    logStream = fs.createWriteStream(filename, { flags: 'a' });
+    console.log(colors.cyan + `[Logger] Recording flight data to ${filename}` + colors.reset);
 }
 
 function parseAndCacheMarket(m) {
@@ -348,6 +377,12 @@ async function refreshTotals() {
         if (currentSynthTotal > 1000) synthTotalEquity = currentSynthTotal;
 
         console.log(`[Equity] User: $${userTotalEquity.toFixed(2)} | Synth: $${synthTotalEquity.toFixed(2)}`);
+
+        logJson('HEALTH', {
+            userEquity: userTotalEquity,
+            synthEquity: synthTotalEquity,
+            userCollateral: userCollateral
+        });
     } catch (e) { }
 }
 
@@ -421,6 +456,17 @@ async function handleTradeLog(log) {
 
     console.log(colors.blue + `[DETECTED] Synth ${synthBought ? "BOUGHT" : "SOLD"} ${shareAmount.toFixed(1)} shares @ $${pricePaid.toFixed(2)} in "${marketInfo.outcomeLabel}"` + colors.reset);
 
+    logJson('STIMULUS', {
+        market: marketInfo.outcomeLabel,
+        tokenId: riskTokenId,
+        action: synthBought ? "BUY" : "SELL",
+        shares: shareAmount,
+        price: pricePaid,
+        maker: maker,
+        taker: taker,
+        txHash: log.transactionHash
+    });
+
     const signedDelta = synthBought ? shareAmount : -shareAmount;
     shadowPortfolio.update(riskTokenId, signedDelta, pricePaid, marketInfo);
 }
@@ -428,6 +474,16 @@ async function handleTradeLog(log) {
 async function placeOrder(tokenId, price, size, side, marketInfo) {
     price = Math.min(Math.max(price, 0.02), 0.98);
     size = Math.floor(size * 10) / 10;
+    const sideStr = side === Side.BUY ? "BUY" : "SELL";
+
+    // [LOGGING] Log the attempt
+    logJson('EXECUTION_ATTEMPT', {
+        market: marketInfo.outcomeLabel,
+        tokenId: tokenId,
+        side: sideStr,
+        size: size,
+        price: price
+    });
 
     try {
         const orderParams = {
@@ -438,19 +494,31 @@ async function placeOrder(tokenId, price, size, side, marketInfo) {
             feeRateBps: 0,
         };
 
-        const sideStr = side === Side.BUY ? "BUY" : "SELL";
         console.log(colors.yellow + `>>> PLACING ORDER: ${sideStr} ${size} @ $${price.toFixed(2)}` + colors.reset);
 
         const order = await clobClient.createAndPostOrder(orderParams, { tickSize: marketInfo.tickSize, negRisk: marketInfo.negRisk });
 
         if (order && order.orderID) {
             console.log(colors.green + `[SUCCESS] Order ID: ${order.orderID}` + colors.reset);
+
+            // [LOGGING] Log success
+            logJson('EXECUTION_SUCCESS', {
+                orderID: order.orderID,
+                market: marketInfo.outcomeLabel
+            });
         } else {
             console.log(colors.red + `[FAILURE] API returned success but no Order ID. Raw: ${JSON.stringify(order)}` + colors.reset);
             throw new Error("API returned no Order ID");
         }
     } catch (e) {
         console.error(colors.red + `[ORDER FAILED] ${e.message}` + colors.reset);
+
+        // [LOGGING] Log the specific error
+        logJson('EXECUTION_ERROR', {
+            market: marketInfo.outcomeLabel,
+            error: e.message,
+            stack: e.stack
+        });
         throw e;
     }
 }
@@ -535,6 +603,14 @@ async function reconcileShadowPortfolio() {
             // If drift exceeds threshold, force correct it
             if (Math.abs(delta) > EXECUTION_THRESHOLD) {
                 console.log(colors.magenta + `[Reconcile] Drift detected on ${market.outcomeLabel}. Shadow: ${currentShadowSize.toFixed(1)} -> Real: ${realSize.toFixed(1)}` + colors.reset);
+                logJson('RECONCILIATION', {
+                    market: market.outcomeLabel,
+                    tokenId: tokenId,
+                    synthReal: realSize,
+                    shadowLocal: currentShadowSize,
+                    drift: delta,
+                    action: "FORCE_UPDATE"
+                });
 
                 // If we are catching up a BUY (delta > 0), we use a high price (0.95) for the update.
                 // This ensures the subsequent 'execute' logic sets a high enough limit price to actually enter.
