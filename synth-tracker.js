@@ -45,6 +45,7 @@ const NEG_RISK_EXCHANGE = '0xC5d563A36AE78145C45a50134d48A1215220f80a'.toLowerCa
 
 const SLIPPAGE_BUFFER = 0.03;
 const EXECUTION_THRESHOLD = 5;
+const MIN_TRADE_DOLLAR_VALUE = 1.10;
 const POLL_INTERVAL_MS = 120000;
 const REDEEM_INTERVAL_MS = 60000;
 const RECONCILE_INTERVAL_MS = 45000;
@@ -78,6 +79,7 @@ let activeConditions = new Set();
 let initialSynthMarkets = new Set();
 let logStream;
 let myOnChainPositions = new Map();
+let pendingOrders = new Set();
 
 function logJson(type, data) {
     if (!logStream) return;
@@ -122,6 +124,13 @@ class ShadowPortfolio {
         const shadow = this.positions.get(tokenId);
         if (!shadow) return;
 
+        // [FIX] Busy Check: If we are already trading this token, wait.
+        // This prevents the "Not enough balance" error caused by stacking buy orders.
+        if (pendingOrders.has(tokenId)) {
+            console.log(colors.gray + `[BUSY] Skipping ${shadow.market.outcomeLabel} check - Order pending.` + colors.reset);
+            return;
+        }
+
         const effectiveUserEquity = userTotalEquity > 0 ? userTotalEquity : 530;
         const scaleRatio = effectiveUserEquity / synthTotalEquity;
         const targetSize = shadow.netShares * scaleRatio;
@@ -130,8 +139,13 @@ class ShadowPortfolio {
         const diff = targetSize - currentSize;
         const absDiff = Math.abs(diff);
 
+        // [NEW] Calculate estimated Dollar Value ($1.10 Rule)
+        // Use avgEntry price as estimate, default to $0.50 if unknown to be safe
+        const estimatedPrice = shadow.avgEntry > 0 ? shadow.avgEntry : 0.5;
+        const estimatedValue = absDiff * estimatedPrice;
+
         // [LOGGING] Capture the state of the brain
-        const decision = absDiff < EXECUTION_THRESHOLD ? "ACCUMULATING" : "TRIGGER";
+        const decision = (absDiff >= EXECUTION_THRESHOLD && estimatedValue >= MIN_TRADE_DOLLAR_VALUE) ? "TRIGGER" : "ACCUMULATING";
 
         logJson('BRAIN', {
             market: shadow.market.outcomeLabel,
@@ -140,53 +154,54 @@ class ShadowPortfolio {
             myTarget: targetSize,
             myActual: currentSize,
             diff: diff,
+            estValue: estimatedValue, // Log the $ value
             threshold: EXECUTION_THRESHOLD,
+            minVal: MIN_TRADE_DOLLAR_VALUE,
             decision: decision
         });
 
-        if (absDiff < EXECUTION_THRESHOLD) {
-            console.log(colors.gray + `[Accumulating] ${shadow.market.outcomeLabel}: ShadowTarget=${targetSize.toFixed(1)} | Actual=${currentSize.toFixed(1)} | Diff=${diff.toFixed(2)}` + colors.reset);
+        // [CRITICAL FIX] Trigger only if shares > 5 AND value > $1.10
+        if (absDiff < EXECUTION_THRESHOLD || estimatedValue < MIN_TRADE_DOLLAR_VALUE) {
+            console.log(colors.gray + `[Accumulating] ${shadow.market.outcomeLabel}: Diff ${diff.toFixed(1)} ($${estimatedValue.toFixed(2)}) < Thresholds` + colors.reset);
             return;
         }
 
-        console.log(colors.magenta + `[TRIGGER] ${shadow.market.outcomeLabel}: Diff ${diff.toFixed(2)} exceeds threshold!` + colors.reset);
+        console.log(colors.magenta + `[TRIGGER] ${shadow.market.outcomeLabel}: Diff ${diff.toFixed(2)} ($${estimatedValue.toFixed(2)}) > $${MIN_TRADE_DOLLAR_VALUE}. Executing!` + colors.reset);
         this.execute(tokenId, diff, shadow.avgEntry, shadow.market);
     }
 
     async execute(tokenId, sizeToFill, avgEntryPrice, market) {
+        // [FIX] Lock this token so we don't double-buy
+        pendingOrders.add(tokenId);
+
         const side = sizeToFill > 0 ? Side.BUY : Side.SELL;
         let finalSize = Math.abs(sizeToFill);
 
-        // [UPDATE] Dynamic Wallet Balance Check
+        // Dynamic Wallet Balance Check
         if (side === Side.BUY) {
             const estimatedCost = finalSize * avgEntryPrice;
-
-            // Check if we can afford this trade
             if (estimatedCost > userCollateral) {
                 console.log(colors.yellow + `[ADJUST] Target cost $${estimatedCost.toFixed(2)} exceeds wallet balance $${userCollateral.toFixed(2)}.` + colors.reset);
-
-                // Recalculate max shares we can buy with available funds (leaving 1% buffer for rounding)
                 const affordableSize = (userCollateral * 0.99) / avgEntryPrice;
 
                 if (affordableSize < 1) {
                     console.log(colors.red + `[SKIP] Available funds ($${userCollateral.toFixed(2)}) too low for minimum trade.` + colors.reset);
+                    pendingOrders.delete(tokenId); // [FIX] Unlock before return
                     return;
                 }
-
                 console.log(colors.yellow + `[ADJUST] Resizing order from ${finalSize.toFixed(1)} -> ${affordableSize.toFixed(1)} shares.` + colors.reset);
                 finalSize = affordableSize;
             }
         }
 
-        // [FIX] HARD SELL CHECK
-        // If we are trying to SELL, check if we actually have the shares.
+        // Sell Check
         if (side === Side.SELL) {
             const owned = myOnChainPositions.get(tokenId) || 0;
             if (owned < 0.1) {
                 console.log(colors.red + `[SKIP SELL] Shadow wants to sell ${finalSize}, but on-chain balance is ${owned}. Ignoring.` + colors.reset);
+                pendingOrders.delete(tokenId); // [FIX] Unlock before return
                 return;
             }
-            // If we try to sell more than we own (drift error), cap it to what we own
             if (finalSize > owned) {
                 console.log(colors.yellow + `[ADJUST] Cap sell size from ${finalSize} to owned balance ${owned}.` + colors.reset);
                 finalSize = owned;
@@ -194,26 +209,25 @@ class ShadowPortfolio {
         }
 
         let limitPrice = sizeToFill > 0 ? (avgEntryPrice + SLIPPAGE_BUFFER) : (avgEntryPrice - SLIPPAGE_BUFFER);
-        limitPrice = Math.min(Math.max(limitPrice, 0.05), 0.95);
+        limitPrice = Math.min(Math.max(limitPrice, 0.02), 0.98); // [UPDATED] Standard Polymarket Range 2c-98c
 
         try {
-            // Use finalSize instead of sizeToFill
             await placeOrder(tokenId, limitPrice, finalSize, side, market);
 
-            // SUCCESS: Update local state to reflect what we actually did
+            // Update local state on success
             const current = myOnChainPositions.get(tokenId) || 0;
             const signedChange = side === Side.BUY ? finalSize : -finalSize;
             myOnChainPositions.set(tokenId, current + signedChange);
 
-            // Update collateral estimate locally so we don't try to double-spend before the next API refresh
-            if (side === Side.BUY) {
-                userCollateral -= (finalSize * limitPrice);
-            } else {
-                userCollateral += (finalSize * limitPrice);
-            }
+            // Update collateral estimate
+            if (side === Side.BUY) userCollateral -= (finalSize * limitPrice);
+            else userCollateral += (finalSize * limitPrice);
 
         } catch (e) {
-            // Failure is logged in placeOrder
+            // Error logging is handled in placeOrder
+        } finally {
+            // [FIX] ALWAYS Unlock the token, success or failure
+            pendingOrders.delete(tokenId);
         }
     }
 }
