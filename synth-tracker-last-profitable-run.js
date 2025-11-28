@@ -47,7 +47,7 @@ const EXECUTION_THRESHOLD = 5;
 const MIN_TRADE_DOLLAR_VALUE = 1.10;
 const POLL_INTERVAL_MS = 30000;
 const REDEEM_INTERVAL_MS = 60000;
-const RECONCILE_INTERVAL_MS = 10000;
+const RECONCILE_INTERVAL_MS = 45000;
 
 const ORDER_FILLED_TOPIC = ethers.utils.keccak256(ethers.utils.toUtf8Bytes('OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)'));
 
@@ -90,7 +90,7 @@ function logJson(type, data) {
     logStream.write(entry + '\n');
 }
 
-// --- SHADOW PORTFOLIO (FIXED) ---
+// --- SHADOW PORTFOLIO ---
 class ShadowPortfolio {
     constructor() {
         this.positions = new Map();
@@ -116,38 +116,48 @@ class ShadowPortfolio {
                 pos.totalCost = pos.totalCost * reduceRatio;
             }
         }
-        // [CHANGE] Pass the LATEST price (pricePaid) to the trigger logic
-        this.checkTrigger(tokenId, pricePaid);
+        this.checkTrigger(tokenId);
     }
 
-    async checkTrigger(tokenId, currentMarketPrice) {
+    // [UPDATED] Now async to support real-time balance verification
+    async checkTrigger(tokenId) {
         const shadow = this.positions.get(tokenId);
         if (!shadow) return;
 
-        if (pendingOrders.has(tokenId)) return;
+        // 1. Fast Busy Check
+        if (pendingOrders.has(tokenId)) {
+            console.log(colors.gray + `[BUSY] Skipping ${shadow.market.outcomeLabel} - Order pending.` + colors.reset);
+            return;
+        }
 
-        // Sync memory with reality
-        // try {
-        //     const ctfContract = new ethers.Contract(CTF_ADDRESS, CTF_ABI, provider);
-        //     const rawBalance = await ctfContract.balanceOf(POLYMARKET_PROXY_ADDRESS_LOWER_CASE, tokenId);
-        //     const trueBalance = parseFloat(ethers.utils.formatUnits(rawBalance, 6));
-        //     myOnChainPositions.set(tokenId, trueBalance);
-        // } catch (e) {
-        //     return;
-        // }
+        // 2. [CRITICAL FIX] Fetch TRUE on-chain balance to prevent "Ghost Share" selling
+        // This prevents the "not enough balance" error by ensuring we never try to sell what we don't own.
+        try {
+            const ctfContract = new ethers.Contract(CTF_ADDRESS, CTF_ABI, provider);
+            const rawBalance = await ctfContract.balanceOf(POLYMARKET_PROXY_ADDRESS_LOWER_CASE, tokenId);
+            const trueBalance = parseFloat(ethers.utils.formatUnits(rawBalance, 6));
+            myOnChainPositions.set(tokenId, trueBalance); // Sync memory with reality
+        } catch (e) {
+            // If the RPC fails, we abort this cycle rather than trading on bad data
+            // console.error(colors.red + `[Balance Check Failed] ${e.message}` + colors.reset);
+            return;
+        }
 
+        // 3. Re-Check Busy (in case another order fired while we were awaiting balance)
         if (pendingOrders.has(tokenId)) return;
 
         const effectiveUserEquity = userTotalEquity > 0 ? userTotalEquity : 530;
         const scaleRatio = effectiveUserEquity / synthTotalEquity;
         const targetSize = shadow.netShares * scaleRatio;
 
+        // Use the fresh real number we just fetched
         const currentSize = myOnChainPositions.get(tokenId) || 0;
         const diff = targetSize - currentSize;
         const absDiff = Math.abs(diff);
 
-        // Value check
-        const estimatedValue = absDiff * currentMarketPrice; // [CHANGE] Use current price for value est
+        // 4. Calculate Estimated Value for the $1.10 Rule
+        const estimatedPrice = shadow.avgEntry > 0 ? shadow.avgEntry : 0.5;
+        const estimatedValue = absDiff * estimatedPrice;
 
         const decision = (absDiff >= EXECUTION_THRESHOLD && estimatedValue >= MIN_TRADE_DOLLAR_VALUE) ? "TRIGGER" : "ACCUMULATING";
 
@@ -168,69 +178,70 @@ class ShadowPortfolio {
 
         console.log(colors.magenta + `[TRIGGER] ${shadow.market.outcomeLabel}: Diff ${diff.toFixed(2)} ($${estimatedValue.toFixed(2)}) > $${MIN_TRADE_DOLLAR_VALUE}. Executing!` + colors.reset);
 
-        // [CHANGE] Pass currentMarketPrice instead of shadow.avgEntry
-        this.execute(tokenId, diff, currentMarketPrice, shadow.market);
+        this.execute(tokenId, diff, shadow.avgEntry, shadow.market);
     }
 
-    async execute(tokenId, sizeToFill, executionPrice, market) {
+    async execute(tokenId, sizeToFill, avgEntryPrice, market) {
+        // [FIX] Lock this token so we don't double-buy
         pendingOrders.add(tokenId);
 
         const side = sizeToFill > 0 ? Side.BUY : Side.SELL;
         let finalSize = Math.abs(sizeToFill);
 
-        // Wallet Balance Check
+        // Dynamic Wallet Balance Check
         if (side === Side.BUY) {
-            const estimatedCost = finalSize * executionPrice;
+            const estimatedCost = finalSize * avgEntryPrice;
             if (estimatedCost > userCollateral) {
                 console.log(colors.yellow + `[ADJUST] Target cost $${estimatedCost.toFixed(2)} exceeds wallet balance $${userCollateral.toFixed(2)}.` + colors.reset);
-                let affordableSize = (userCollateral * 0.99) / executionPrice;
-                affordableSize = Math.floor(affordableSize * 100) / 100;
+                // const affordableSize = (userCollateral * 0.99) / avgEntryPrice;
+                let affordableSize = (userCollateral * 0.99) / avgEntryPrice;
+                affordableSize = Math.floor(affordableSize * 100) / 100; // <--- The Fix
                 if (affordableSize < 1) {
-                    console.log(colors.red + `[SKIP] Funds low.` + colors.reset);
-                    pendingOrders.delete(tokenId);
+                    console.log(colors.red + `[SKIP] Available funds ($${userCollateral.toFixed(2)}) too low for minimum trade.` + colors.reset);
+                    pendingOrders.delete(tokenId); // [FIX] Unlock before return
                     return;
                 }
+                console.log(colors.yellow + `[ADJUST] Resizing order from ${finalSize.toFixed(1)} -> ${affordableSize.toFixed(1)} shares.` + colors.reset);
                 finalSize = affordableSize;
             }
         }
 
-        // Sell Check (Strict)
+        // Sell Check
         if (side === Side.SELL) {
             const owned = myOnChainPositions.get(tokenId) || 0;
             if (owned < 0.1) {
-                console.log(colors.red + `[SKIP SELL] No shares owned.` + colors.reset);
-                pendingOrders.delete(tokenId);
+                console.log(colors.red + `[SKIP SELL] Shadow wants to sell ${finalSize}, but on-chain balance is ${owned}. Ignoring.` + colors.reset);
+                pendingOrders.delete(tokenId); // [FIX] Unlock before return
                 return;
             }
             if (finalSize > owned) {
+                console.log(colors.yellow + `[ADJUST] Cap sell size from ${finalSize} to owned balance ${owned}.` + colors.reset);
                 finalSize = owned;
             }
         }
 
-        // [CHANGE] Aggressive 10% Slippage Buffer to ensure GTC fill
-        // Since we are copying a whale, the price is moving AWAY from us. We must chase it.
         const slippagePct = 0.05;
-        const dynamicBuffer = Math.max(executionPrice * slippagePct, 0.04);
+        const dynamicBuffer = Math.max(avgEntryPrice * slippagePct, 0.02);
 
-        let limitPrice = sizeToFill > 0 ? (executionPrice + dynamicBuffer) : (executionPrice - dynamicBuffer);
+        let limitPrice = sizeToFill > 0 ? (avgEntryPrice + dynamicBuffer) : (avgEntryPrice - dynamicBuffer);
+
         limitPrice = Math.min(Math.max(limitPrice, 0.02), 0.98);
-
         try {
             await placeOrder(tokenId, limitPrice, finalSize, side, market);
 
-            if (side === Side.BUY) {
-                userCollateral -= (finalSize * limitPrice);
-            }
+            // Update local state on success
+            const current = myOnChainPositions.get(tokenId) || 0;
+            const signedChange = side === Side.BUY ? finalSize : -finalSize;
+            myOnChainPositions.set(tokenId, current + signedChange);
 
-            // [NEW] Optimistic Update
-            // We assume the order fills because we are using GTC + 10% buffer.
-            // This prevents the "Double Buy" bug if Synth trades again in 1 second.
-            const currentPos = myOnChainPositions.get(tokenId) || 0;
-            const newPos = side === Side.BUY ? (currentPos + finalSize) : (currentPos - finalSize);
-            myOnChainPositions.set(tokenId, newPos);
+            // Update collateral estimate
+            if (side === Side.BUY) userCollateral -= (finalSize * limitPrice);
+            else userCollateral += (finalSize * limitPrice);
+
         } catch (e) {
-            // Logs handled in placeOrder
+            // Error logging is handled in placeOrder
         } finally {
+            // [FIX] ALWAYS Unlock the token, success or failure
             pendingOrders.delete(tokenId);
         }
     }
@@ -536,9 +547,7 @@ async function placeOrder(tokenId, price, size, side, marketInfo) {
         // Let's stick to FOK if IOC isn't available, but with better rounding.
         // NOTE: clob-client usually treats FOK as FOK and GTD/GTC as Limit.
         // Let's try OrderType.IOC if available, otherwise FOK.
-
-        // const type = OrderType.IOC || OrderType.FOK;
-        const type = OrderType.GTC;
+        const type = OrderType.IOC || OrderType.FOK;
 
         const order = await clobClient.createAndPostOrder(orderParams, { tickSize: marketInfo.tickSize, negRisk: marketInfo.negRisk }, type);
 
@@ -626,54 +635,26 @@ async function checkAndRedeem() {
     }
 }
 
-// [NEW] Sweeper to kill Zombie Orders
-async function cancelOpenOrdersForToken(tokenId) {
-    try {
-        // Fetch open orders specifically for this token
-        // Note: The specific filter syntax depends on the clob-client version, 
-        // but often we can just cancel all for a market or filter manually.
-        const orders = await clobClient.getOpenOrders({ tokenID: tokenId });
-
-        if (orders.length > 0) {
-            console.log(colors.magenta + `[Sweeper] Found ${orders.length} open GTC orders for ${tokenId}. Cancelling...` + colors.reset);
-            // Cancel them one by one (or use batch if supported)
-            for (const order of orders) {
-                await clobClient.cancelOrder({ orderID: order.orderID });
-            }
-        }
-    } catch (e) {
-        // Ignore "No orders found" errors
-    }
-}
-
 // [NEW] Truth Loop: Fixes State Drift between WebSocket and Reality
-// [NEW] "Double-Tap" Reconciliation Loop
-// This function acts as the "Sweeper". If our passive Limit orders miss,
-// this loop detects the missing shares and forces a buy at market price.
 async function reconcileShadowPortfolio() {
+    // console.log(colors.gray + "[Truth Loop] Checking for state drift..." + colors.reset);
     try {
-        // 1. Fetch BOTH Portfolios (Synth's Reality vs Your Reality)
-        const [synthResp, myResp] = await Promise.all([
-            axios.get(`${DATA_API_URL}/positions`, { params: { user: SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE } }),
-            axios.get(`${DATA_API_URL}/positions`, { params: { user: POLYMARKET_PROXY_ADDRESS_LOWER_CASE } })
-        ]);
-
-        // Map Synth's Positions
-        const synthMap = new Map();
-        synthResp.data.filter(p => parseFloat(p.size) > 0.1).forEach(p => {
-            synthMap.set(p.asset, parseFloat(p.size));
+        // 1. Fetch Synth's Current Reality
+        const response = await axios.get(`${DATA_API_URL}/positions`, {
+            params: { user: SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE }
         });
 
-        // Map MY Real Positions (On-Chain Truth)
-        const myMap = new Map();
-        myResp.data.filter(p => parseFloat(p.size) > 0.1).forEach(p => {
-            myMap.set(p.asset, parseFloat(p.size));
-        });
+        // Filter out dust (< 0.1 shares)
+        const synthActualPositions = response.data.filter(p => parseFloat(p.size) > 0.1);
+        const synthMap = new Map(); // Keep track of what Synth currently holds
 
-        // 2. Calculate Target vs. Actual
-        // We iterate over Synth's holdings to see what we are missing
-        for (const [tokenId, synthRealSize] of synthMap) {
+        // 2. Sync Reality -> Shadow
+        for (const p of synthActualPositions) {
+            const tokenId = p.asset;
+            const realSize = parseFloat(p.size);
+            synthMap.set(tokenId, realSize);
 
+            // STRICTLY IGNORE BLACKLISTED MARKETS
             if (initialSynthMarkets.has(tokenId)) continue;
 
             // Ensure we have market data
@@ -681,58 +662,46 @@ async function reconcileShadowPortfolio() {
             if (!market) market = await fetchMarketByTokenId(tokenId);
             if (!market) continue;
 
-            // Calculate Target (Scaled)
-            const effectiveUserEquity = userTotalEquity > 0 ? userTotalEquity : 530;
-            const scaleRatio = effectiveUserEquity / synthTotalEquity;
+            // Calculate Drift
+            const shadowPos = shadowPortfolio.positions.get(tokenId);
+            const currentShadowSize = shadowPos ? shadowPos.netShares : 0;
+            const delta = realSize - currentShadowSize;
 
-            // Calculate Drift based on REALITY, not Shadow Memory
-            // Target: What we SHOULD have based on Synth
-            // Actual: What we ACTUALLY have on chain
-            const targetSize = synthRealSize * scaleRatio;
-            const actualSize = myMap.get(tokenId) || 0;
-            const delta = targetSize - actualSize;
-
-            // If drift exceeds threshold, it means our Limit Order missed (or Synth moved again)
+            // If drift exceeds threshold, force correct it
             if (Math.abs(delta) > EXECUTION_THRESHOLD) {
-                console.log(colors.magenta + `[Reconcile] Drift on ${market.outcomeLabel}. Target: ${targetSize.toFixed(1)} | Actual: ${actualSize.toFixed(1)} | Drift: ${delta.toFixed(1)}` + colors.reset);
-
-                // 1. Kill the failed Limit Order (if any) to unlock funds
-                await cancelOpenOrdersForToken(tokenId);
-
-                // 2. Fire "Panic" Order
-                // If we are buying (delta > 0), price = 0.99 (Market Buy)
-                // If we are selling (delta < 0), price = 0 (Market Sell)
-                const catchUpPrice = delta > 0 ? 0.99 : 0; // Aggressive force-fill
-
+                console.log(colors.magenta + `[Reconcile] Drift detected on ${market.outcomeLabel}. Shadow: ${currentShadowSize.toFixed(1)} -> Real: ${realSize.toFixed(1)}` + colors.reset);
                 logJson('RECONCILIATION', {
                     market: market.outcomeLabel,
                     tokenId: tokenId,
-                    target: targetSize,
-                    actual: actualSize,
+                    synthReal: realSize,
+                    shadowLocal: currentShadowSize,
                     drift: delta,
-                    action: "FORCE_CORRECTION"
+                    action: "FORCE_UPDATE"
                 });
 
-                // Trigger execution directly
+                // If we are catching up a BUY (delta > 0), we use a high price (0.95) for the update.
+                // This ensures the subsequent 'execute' logic sets a high enough limit price to actually enter.
+                // If we are SELLING (delta < 0), the price param is ignored by the logic anyway.
+                const catchUpPrice = delta > 0 ? 0.95 : 0;
+
+                // This updates the shadow state AND triggers 'checkTrigger', which forces the bot to trade
                 shadowPortfolio.update(tokenId, delta, catchUpPrice, market);
             }
         }
 
-        // 3. Kill Ghosts (We hold it, Synth doesn't)
-        for (const [tokenId, mySize] of myMap) {
-            if (mySize > 0.1 && !synthMap.has(tokenId)) {
+        // 3. Kill Ghosts (Positions Shadow thinks we have, but Synth has sold)
+        for (const [tokenId, shadow] of shadowPortfolio.positions) {
+            // If shadow thinks we have shares (> 0.1) AND Synth does NOT have this token anymore
+            if (shadow.netShares > 0.1 && !synthMap.has(tokenId)) {
+
+                // Double check blacklist to be safe (shouldn't happen, but safety first)
                 if (initialSynthMarkets.has(tokenId)) continue;
 
-                // Market check
-                let market = marketCache.get(tokenId) || { outcomeLabel: "Unknown" };
+                console.log(colors.magenta + `[Reconcile] Ghost position detected on ${shadow.market.outcomeLabel}. Force closing.` + colors.reset);
 
-                console.log(colors.magenta + `[Reconcile] Ghost detected (${market.outcomeLabel}). Dumping.` + colors.reset);
-
-                await cancelOpenOrdersForToken(tokenId);
-
-                // Sell everything
-                const delta = -mySize;
-                shadowPortfolio.update(tokenId, delta, 0, market);
+                // Create a negative delta exactly equal to current shares to zero it out
+                const delta = -shadow.netShares;
+                shadowPortfolio.update(tokenId, delta, 0, shadow.market);
             }
         }
 
@@ -781,23 +750,7 @@ async function startTracker() {
     setInterval(checkAndRedeem, REDEEM_INTERVAL_MS);
     setInterval(scanUpcomingMarkets, POLL_INTERVAL_MS);
     setInterval(refreshTotals, 60000);
-    setInterval(fetchMyPositions, 15000);
+    setInterval(fetchMyPositions, 120000);
 }
-
-// --- CRASH GUARD ---
-process.on('uncaughtException', (err) => {
-    if (err.message.includes('reading \'callback\'') || err.message.includes('WebSocket')) {
-        console.log(colors.yellow + `[Stabilizer] Caught library WebSocket error. Reconnecting...` + colors.reset);
-        // We don't need to do anything else; the heartbeat intervals will eventually 
-        // fail and trigger the existing 'close' logic, or we can force a restart:
-        if (provider && provider._websocket) {
-            try { provider._websocket.terminate(); } catch (e) { }
-        }
-        // The existing 'close' listener in startTracker will handle the reconnect
-    } else {
-        console.error(colors.red + `[CRITICAL] Uncaught exception: ${err.message}` + colors.reset);
-        process.exit(1); // Exit on real logic errors
-    }
-});
 
 startTracker();
