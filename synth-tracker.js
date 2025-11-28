@@ -207,27 +207,44 @@ class ShadowPortfolio {
             }
         }
 
-        // [CHANGE] Aggressive 10% Slippage Buffer to ensure GTC fill
-        // Since we are copying a whale, the price is moving AWAY from us. We must chase it.
+        // [LOGIC UPDATE] If 'executionPrice' is passed as a specific Limit (e.g. from Reconcile), use it.
+        // Otherwise (if it's from a trade event), calculate the 5% buffer.
+
+        // Heuristic: If executionPrice is < 0.99, treat it as the Base Price and add buffer.
+        // BUT, if reconcile passed a calculated limit, we might double-buffer.
+        // Since Reconcile passes "SynthPrice * 1.05", we should use that DIRECTLY.
+
+        // Let's just use the buffer logic for consistency, but ensure reconcile passes base price.
+        // ACTUALLY: simpler way ->
+
         const slippagePct = 0.05;
         const dynamicBuffer = Math.max(executionPrice * slippagePct, 0.04);
 
+        // If selling, price 0 means "Market Sell" (0.02 limit).
+        // If buying, add buffer.
         let limitPrice = sizeToFill > 0 ? (executionPrice + dynamicBuffer) : (executionPrice - dynamicBuffer);
         limitPrice = Math.min(Math.max(limitPrice, 0.02), 0.98);
 
         try {
-            await placeOrder(tokenId, limitPrice, finalSize, side, market);
+            // [CHANGE] Capture the success boolean from placeOrder
+            const success = await placeOrder(tokenId, limitPrice, finalSize, side, market);
 
-            if (side === Side.BUY) {
-                userCollateral -= (finalSize * limitPrice);
+            if (success) {
+                // ONLY update local state if the order actually succeeded
+                if (side === Side.BUY) {
+                    userCollateral -= (finalSize * limitPrice);
+                }
+
+                // Update Position Tracking
+                const currentPos = myOnChainPositions.get(tokenId) || 0;
+                const newPos = side === Side.BUY ? (currentPos + finalSize) : (currentPos - finalSize);
+                myOnChainPositions.set(tokenId, newPos);
+            } else {
+                // If success is false (order killed), do NOT update state.
+                // The bot will naturally retry in the next loop.
+                console.log(colors.gray + `[FAK Miss] Order killed. Retrying next tick.` + colors.reset);
             }
 
-            // [NEW] Optimistic Update
-            // We assume the order fills because we are using GTC + 10% buffer.
-            // This prevents the "Double Buy" bug if Synth trades again in 1 second.
-            const currentPos = myOnChainPositions.get(tokenId) || 0;
-            const newPos = side === Side.BUY ? (currentPos + finalSize) : (currentPos - finalSize);
-            myOnChainPositions.set(tokenId, newPos);
         } catch (e) {
             // Logs handled in placeOrder
         } finally {
@@ -493,18 +510,12 @@ async function placeOrder(tokenId, price, size, side, marketInfo) {
     // 1. Price Safety
     price = Math.min(Math.max(price, 0.02), 0.98);
 
-    // 2. Precision Fix for FOK/IOC
-    // [CRITICAL FIX] Force Integer sizes.
-    // Why: Cost = Size * Price.
-    // Price is always 2 decimals (e.g. 0.98).
-    // To guarantee Cost is 2 decimals (required by API), Size MUST be an Integer.
-    // 10.39 * 0.98 = 10.1822 (Invalid Cost)
-    // 10.00 * 0.98 = 9.80 (Valid Cost)
+    // 2. Precision Fix
     size = Math.floor(size);
 
     if (size < 1) {
         console.log(colors.red + `[SKIP] Size ${size} too small after integer rounding.` + colors.reset);
-        return;
+        return false; // RETURN FALSE
     }
 
     const sideStr = side === Side.BUY ? "BUY" : "SELL";
@@ -527,26 +538,12 @@ async function placeOrder(tokenId, price, size, side, marketInfo) {
             expiration: 0,
         };
 
-        console.log(colors.yellow + `>>> PLACING IOC ORDER: ${sideStr} ${size} @ $${price.toFixed(2)}` + colors.reset);
-
-        // [CHANGE] Switch FOK -> IOC (Immediate or Cancel)
-        // This allows partial fills, reducing "Killed" errors
-        // IOC is technically "GTC" with expiration: 0 or special flag, but clob-client maps IOC->FAK often.
-        // If OrderType.IOC is undefined, use OrderType.FOK but we really want IOC.
-        // Let's stick to FOK if IOC isn't available, but with better rounding.
-        // NOTE: clob-client usually treats FOK as FOK and GTD/GTC as Limit.
-        // Let's try OrderType.IOC if available, otherwise FOK.
-
-        // const type = OrderType.IOC || OrderType.FOK;
-        const type = OrderType.GTC;
+        console.log(colors.yellow + `>>> PLACING FAK ORDER: ${sideStr} ${size} @ $${price.toFixed(2)}` + colors.reset);
+        const type = OrderType.FAK;
 
         const order = await clobClient.createAndPostOrder(orderParams, { tickSize: marketInfo.tickSize, negRisk: marketInfo.negRisk }, type);
 
-        if (!order || (!order.orderID && !order.orderIds)) {
-            console.log(colors.red + `[DEBUG] API Response: ${JSON.stringify(order)}` + colors.reset);
-            logJson('DEBUG_RAW_API', order);
-        }
-
+        // CHECK SUCCESS
         if (order && (order.orderID || (order.orderIds && order.orderIds.length > 0))) {
             const id = order.orderID || order.orderIds[0];
             console.log(colors.green + `[SUCCESS] Order ID: ${id}` + colors.reset);
@@ -555,29 +552,40 @@ async function placeOrder(tokenId, price, size, side, marketInfo) {
                 orderID: id,
                 market: marketInfo.outcomeLabel
             });
-        } else {
-            // Only throw if it's NOT a "Kill" message (which is valid flow)
-            const msg = JSON.stringify(order);
-            if (msg.includes("fully filled")) {
-                console.log(colors.gray + `[MISSED] Order killed (no liquidity).` + colors.reset);
-                return; // Don't crash, just exit
-            }
-            throw new Error(`API returned no Order ID. Response: ${msg}`);
+            return true; // <--- CRITICAL: Return Success
         }
+
+        // CHECK FAILURE (Kill)
+        const msg = JSON.stringify(order);
+        if (msg.includes("fully filled") || msg.includes("killed")) {
+            console.log(colors.gray + `[MISSED] Order killed (no liquidity).` + colors.reset);
+            return false; // <--- CRITICAL: Return Failure
+        }
+
+        throw new Error(`API returned no Order ID. Response: ${msg}`);
+
     } catch (e) {
-        // Swallow error if it's just a "Kill" or "Precision" error to keep bot running
-        if (e.message.includes("fully filled") || e.message.includes("invalid amounts")) {
-            console.log(colors.gray + `[API REJECT] ${e.message}` + colors.reset);
-        } else {
-            console.error(colors.red + `[ORDER FAILED] ${e.message}` + colors.reset);
+        // [CHANGE] Robust error handling to ignore "Closed Market" noise
+        const errorMsg = e.message || JSON.stringify(e);
+
+        if (errorMsg.includes("fully filled") || errorMsg.includes("killed") || errorMsg.includes("invalid amounts")) {
+            console.log(colors.gray + `[API REJECT] ${errorMsg}` + colors.reset);
+        }
+        else if (errorMsg.includes("does not exist") || errorMsg.includes("status 400")) {
+            // This happens when we try to sell/buy on a market that just resolved.
+            // We ignore it and let checkAndRedeem() handle the cleanup.
+            console.log(colors.gray + `[SKIP] Market likely closed. Waiting for Redemption.` + colors.reset);
+        }
+        else {
+            console.error(colors.red + `[ORDER FAILED] ${errorMsg}` + colors.reset);
         }
 
         logJson('EXECUTION_ERROR', {
             market: marketInfo.outcomeLabel,
-            error: e.message,
+            error: errorMsg,
             stack: e.stack
         });
-        // Do NOT throw e here, so the bot loop continues
+        return false; // CRITICAL: Return Failure
     }
 }
 
@@ -646,93 +654,115 @@ async function cancelOpenOrdersForToken(tokenId) {
     }
 }
 
-// [NEW] Truth Loop: Fixes State Drift between WebSocket and Reality
-// [NEW] "Double-Tap" Reconciliation Loop
-// This function acts as the "Sweeper". If our passive Limit orders miss,
-// this loop detects the missing shares and forces a buy at market price.
+// [NEW] "Patient Sniper" Reconciliation Loop
+// Fixes "Buying the Top" by placing patient limit orders instead of market-panic buys.
 async function reconcileShadowPortfolio() {
     try {
-        // 1. Fetch BOTH Portfolios (Synth's Reality vs Your Reality)
+        // 1. Fetch Reality
         const [synthResp, myResp] = await Promise.all([
             axios.get(`${DATA_API_URL}/positions`, { params: { user: SYNTH_POLYMARKET_PROXY_ADDRESS_LOWER_CASE } }),
             axios.get(`${DATA_API_URL}/positions`, { params: { user: POLYMARKET_PROXY_ADDRESS_LOWER_CASE } })
         ]);
 
-        // Map Synth's Positions
         const synthMap = new Map();
         synthResp.data.filter(p => parseFloat(p.size) > 0.1).forEach(p => {
             synthMap.set(p.asset, parseFloat(p.size));
         });
 
-        // Map MY Real Positions (On-Chain Truth)
         const myMap = new Map();
         myResp.data.filter(p => parseFloat(p.size) > 0.1).forEach(p => {
             myMap.set(p.asset, parseFloat(p.size));
         });
 
-        // 2. Calculate Target vs. Actual
-        // We iterate over Synth's holdings to see what we are missing
+        // 2. Process each position
         for (const [tokenId, synthRealSize] of synthMap) {
-
             if (initialSynthMarkets.has(tokenId)) continue;
 
-            // Ensure we have market data
             let market = marketCache.get(tokenId);
             if (!market) market = await fetchMarketByTokenId(tokenId);
             if (!market) continue;
 
-            // Calculate Target (Scaled)
+            // Calculate Target
             const effectiveUserEquity = userTotalEquity > 0 ? userTotalEquity : 530;
             const scaleRatio = effectiveUserEquity / synthTotalEquity;
 
-            // Calculate Drift based on REALITY, not Shadow Memory
-            // Target: What we SHOULD have based on Synth
-            // Actual: What we ACTUALLY have on chain
             const targetSize = synthRealSize * scaleRatio;
             const actualSize = myMap.get(tokenId) || 0;
             const delta = targetSize - actualSize;
 
-            // If drift exceeds threshold, it means our Limit Order missed (or Synth moved again)
+            // Threshold check
             if (Math.abs(delta) > EXECUTION_THRESHOLD) {
+
+                // [CRITICAL] Check if we already have an open Limit order for this token
+                // const openOrders = await clobClient.getOpenOrders({ tokenID: tokenId });
+                // if (openOrders.length > 0) {
+                //     // We already have a fishing line in the water. Don't move it.
+                //     // This is "Patience".
+                //     console.log(colors.gray + `[Reconcile] Drift ${delta.toFixed(1)} on ${market.outcomeLabel}, but order already active. Waiting.` + colors.reset);
+                //     continue;
+                // }
+
                 console.log(colors.magenta + `[Reconcile] Drift on ${market.outcomeLabel}. Target: ${targetSize.toFixed(1)} | Actual: ${actualSize.toFixed(1)} | Drift: ${delta.toFixed(1)}` + colors.reset);
 
-                // 1. Kill the failed Limit Order (if any) to unlock funds
-                await cancelOpenOrdersForToken(tokenId);
+                // [STRATEGY UPDATE: Live Market Peg]
+                // 1. Fetch CURRENT market price so we don't get locked out if price ripped higher.
+                let executionBasisPrice = 0;
 
-                // 2. Fire "Panic" Order
-                // If we are buying (delta > 0), price = 0.99 (Market Buy)
-                // If we are selling (delta < 0), price = 0 (Market Sell)
-                const catchUpPrice = delta > 0 ? 0.99 : 0; // Aggressive force-fill
+                try {
+                    const priceResp = await axios.get(`${GAMMA_API_URL}/markets`, { params: { clob_token_ids: tokenId } });
+                    if (priceResp.data && priceResp.data[0]) {
+                        const m = priceResp.data[0];
+                        // Parse JSON fields from API
+                        const tokenIds = JSON.parse(m.clobTokenIds);
+                        const prices = JSON.parse(m.outcomePrices);
+
+                        const idx = tokenIds.indexOf(tokenId);
+                        if (idx !== -1) {
+                            executionBasisPrice = parseFloat(prices[idx]);
+                        }
+                    }
+                } catch (e) {
+                    // Swallow API errors, we will hit the fallback below
+                }
+
+                // 2. Fallback: If API failed, try using Synth's avg entry from memory
+                const shadowPos = shadowPortfolio.positions.get(tokenId);
+                if (executionBasisPrice === 0 && shadowPos && shadowPos.avgEntry > 0) {
+                    executionBasisPrice = shadowPos.avgEntry;
+                }
+
+                // 3. Last Resort: 50c default
+                if (executionBasisPrice === 0) {
+                    executionBasisPrice = 0.50;
+                }
 
                 logJson('RECONCILIATION', {
                     market: market.outcomeLabel,
                     tokenId: tokenId,
-                    target: targetSize,
-                    actual: actualSize,
                     drift: delta,
-                    action: "FORCE_CORRECTION"
+                    action: "CATCH_UP_FAK",
+                    basisPrice: executionBasisPrice
                 });
 
-                // Trigger execution directly
-                shadowPortfolio.update(tokenId, delta, catchUpPrice, market);
+                // 4. Execute
+                // We pass the RAW current price. 
+                // Your 'execute' function already adds the 5% FAK buffer/slippage on top of this.
+                shadowPortfolio.execute(tokenId, delta, executionBasisPrice, market);
             }
         }
 
-        // 3. Kill Ghosts (We hold it, Synth doesn't)
+        // 3. Kill Ghosts
         for (const [tokenId, mySize] of myMap) {
             if (mySize > 0.1 && !synthMap.has(tokenId)) {
                 if (initialSynthMarkets.has(tokenId)) continue;
-
-                // Market check
                 let market = marketCache.get(tokenId) || { outcomeLabel: "Unknown" };
 
-                console.log(colors.magenta + `[Reconcile] Ghost detected (${market.outcomeLabel}). Dumping.` + colors.reset);
-
+                // Kill any pending BUY orders for this ghost
                 await cancelOpenOrdersForToken(tokenId);
 
-                // Sell everything
                 const delta = -mySize;
-                shadowPortfolio.update(tokenId, delta, 0, market);
+                // Force sell
+                shadowPortfolio.execute(tokenId, delta, 0, market);
             }
         }
 
