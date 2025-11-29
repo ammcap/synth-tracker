@@ -590,6 +590,11 @@ async function placeOrder(tokenId, price, size, side, marketInfo) {
 }
 
 async function checkAndRedeem() {
+    if (!signer) {
+        console.log(colors.yellow + "[Redeem] Signer not ready yet. Skipping." + colors.reset);
+        return;
+    }
+    
     let allPositions = [];
     try {
         const response = await axios.get(`${DATA_API_URL}/positions`, { params: { user: POLYMARKET_PROXY_ADDRESS_LOWER_CASE } });
@@ -805,6 +810,8 @@ async function startTracker() {
     await fetchSynthPositions();
     await fetchMyPositions();
     await refreshTotals();
+    console.log(colors.cyan + "[Startup] Checking for redeems..." + colors.reset);
+    await checkAndRedeem();
 
     setInterval(reconcileShadowPortfolio, RECONCILE_INTERVAL_MS);
 
