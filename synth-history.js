@@ -4,7 +4,7 @@ const path = require('path');
 
 // --- CONFIGURATION ---
 const SYNTH_ADDRESS = '0x557bed924a1bb6f62842c5742d1dc789b8d480d4'.toLowerCase();
-const HOURS_TO_LOOK_BACK = 2;
+const HOURS_TO_LOOK_BACK = 1;
 const DATA_API_URL = 'https://data-api.polymarket.com';
 const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
 
@@ -18,9 +18,9 @@ const colors = {
     gray: '\x1b[90m'
 };
 
-// Axios instance with timeout to prevent hanging
+// Axios instance with timeout
 const api = axios.create({
-    timeout: 15000 // 15 seconds timeout
+    timeout: 15000
 });
 
 async function fetchHistory() {
@@ -40,7 +40,7 @@ async function fetchHistory() {
         const limit = 500;
         let keepFetching = true;
         let page = 1;
-        const MAX_PAGES = 50;
+        const MAX_PAGES = 100; // Increased safety limit
 
         while (keepFetching && page <= MAX_PAGES) {
             try {
@@ -56,31 +56,34 @@ async function fetchHistory() {
 
                 const data = response.data;
                 if (!Array.isArray(data) || data.length === 0) {
-                    console.log("Done.");
+                    console.log("Done (Empty).");
                     keepFetching = false;
                 } else {
-                    // --- MANUAL TIME FILTER ---
-                    const freshData = [];
-                    let reachedOldData = false;
-
-                    for (const t of data) {
-                        if (t.timestamp >= startTime) {
-                            freshData.push(t);
-                        } else {
-                            reachedOldData = true;
-                        }
-                    }
+                    // Filter this batch for valid time range
+                    const freshData = data.filter(t => t.timestamp >= startTime);
 
                     console.log(`Found ${freshData.length} relevant items.`);
                     tradeList = tradeList.concat(freshData);
 
-                    if (reachedOldData) {
-                        console.log(colors.green + "      > Reached time limit. Stopping fetch." + colors.reset);
+                    // LOGIC FIX:
+                    // Only stop if the LAST item in the batch is older than our start time.
+                    // This handles cases where data inside the batch is slightly out of order.
+                    const lastItem = data[data.length - 1];
+                    const lastTimestamp = lastItem.timestamp;
+
+                    if (lastTimestamp < startTime) {
+                        console.log(colors.green + "      > Reached time limit (Last item too old). Stopping fetch." + colors.reset);
                         keepFetching = false;
                     } else {
-                        offset += data.length;
-                        page++;
-                        if (data.length < limit) keepFetching = false;
+                        // If we got fewer items than the limit, we reached the end of all data
+                        if (data.length < limit) {
+                            console.log("Done (End of data).");
+                            keepFetching = false;
+                        } else {
+                            // Otherwise, keep digging
+                            offset += data.length;
+                            page++;
+                        }
                     }
                 }
             } catch (e) {
@@ -108,13 +111,14 @@ async function fetchHistory() {
         let offset = 0;
         let keepFetching = true;
         let page = 1;
+        const limit = 100;
 
-        while (keepFetching && page <= 10) {
+        while (keepFetching && page <= 20) {
             try {
                 const response = await api.get(`${DATA_API_URL}/activity`, {
                     params: {
                         user: SYNTH_ADDRESS,
-                        limit: 100,
+                        limit: limit,
                         offset: offset,
                         type: 'REDEEM'
                     }
@@ -122,26 +126,20 @@ async function fetchHistory() {
 
                 const data = response.data;
                 if (Array.isArray(data) && data.length > 0) {
-                    // --- MANUAL TIME FILTER ---
-                    const freshRedeems = [];
-                    let reachedOldData = false;
-
-                    for (const r of data) {
-                        if (r.timestamp >= startTime) {
-                            freshRedeems.push(r);
-                        } else {
-                            reachedOldData = true;
-                        }
-                    }
-
+                    // Filter relevant items
+                    const freshRedeems = data.filter(r => r.timestamp >= startTime);
                     redeemList = redeemList.concat(freshRedeems);
 
-                    if (reachedOldData) {
+                    // LOGIC FIX: Same check as above
+                    const lastItem = data[data.length - 1];
+                    if (lastItem.timestamp < startTime) {
                         keepFetching = false;
                     } else {
-                        offset += data.length;
-                        if (data.length < 100) keepFetching = false;
-                        page++;
+                        if (data.length < limit) keepFetching = false;
+                        else {
+                            offset += data.length;
+                            page++;
+                        }
                     }
                 } else {
                     keepFetching = false;
@@ -155,7 +153,6 @@ async function fetchHistory() {
         return redeemList.map(r => ({
             type: 'REDEEM',
             timestamp: r.timestamp,
-            // UPDATED: Check conditionId/market first for redeems, as they are often not 'asset'
             asset: r.conditionId || r.market || r.asset,
             side: 'REDEEM',
             size: parseFloat(r.size),
@@ -165,11 +162,10 @@ async function fetchHistory() {
         }));
     }
 
-    // 2. Execute Fetches Sequentially
+    // 2. Execute Fetches
     const trades = await getTrades();
     const redeems = await getRedeems();
 
-    // Combine
     const merged = [...trades, ...redeems];
 
     if (merged.length === 0) {
@@ -179,9 +175,8 @@ async function fetchHistory() {
 
     console.log(colors.green + `[Success] Found ${merged.length} events (${trades.length} trades, ${redeems.length} redeems). Enriching...` + colors.reset);
 
-    // 3. Enrich with Market Data (SERIAL MODE - 1 by 1)
+    // 3. Enrich with Market Data
     const tokenIds = new Set(merged.map(x => x.asset));
-    // Filter out undefined assets
     const uniqueTokens = Array.from(tokenIds).filter(x => x);
 
     console.log(colors.gray + `   ...resolving names for ${uniqueTokens.length} items (One-by-One)...` + colors.reset);
@@ -190,21 +185,15 @@ async function fetchHistory() {
 
     for (let i = 0; i < uniqueTokens.length; i++) {
         const id = String(uniqueTokens[i]);
-
-        // Progress indicator
         if (i % 5 === 0) process.stdout.write(colors.gray + `.` + colors.reset);
 
         try {
-            // Small delay to be polite
-            await new Promise(r => setTimeout(r, 100));
+            await new Promise(r => setTimeout(r, 100)); // Rate limit protection
 
-            // Determine if it's a Condition ID (Redeem) or Token ID (Trade)
             let params = {};
             if (id.startsWith('0x')) {
-                // Hex strings are Condition IDs (Markets)
                 params = { condition_ids: id };
             } else {
-                // Numeric strings are Clob Token IDs (Outcomes)
                 params = { clob_token_ids: id };
             }
 
@@ -212,15 +201,12 @@ async function fetchHistory() {
 
             if (resp.data && Array.isArray(resp.data)) {
                 resp.data.forEach(m => {
-                    // Cache by Condition ID (for Redeems)
                     if (m.conditionId) {
                         marketCache.set(m.conditionId, {
                             question: m.question,
-                            outcome: "Winning Position" // Redeems imply the winner
+                            outcome: "Winning Position"
                         });
                     }
-
-                    // Cache by Token IDs (for Trades)
                     const tokens = JSON.parse(m.clobTokenIds || '[]');
                     const outcomes = JSON.parse(m.outcomes || '[]');
                     tokens.forEach((tokenId, index) => {
@@ -233,9 +219,8 @@ async function fetchHistory() {
                 successCount++;
             }
         } catch (e) {
-            // Only log if it's NOT a 404 (which just means data is missing)
             if (e.response && e.response.status !== 404) {
-                console.log(colors.yellow + `\n   [Warning] ID ${id} failed (${e.response ? e.response.status : e.message})` + colors.reset);
+                console.log(colors.yellow + `\n   [Warning] ID ${id} failed` + colors.reset);
             }
         }
     }
@@ -245,18 +230,9 @@ async function fetchHistory() {
     merged.sort((a, b) => b.timestamp - a.timestamp);
 
     const finalData = merged.map(item => {
-        // Ensure lookup uses string key
         const info = marketCache.get(String(item.asset));
-
-        let marketName = "Unknown Market";
-        let outcomeName = "Unknown";
-
-        if (info) {
-            marketName = info.question;
-            outcomeName = info.outcome;
-        } else {
-            marketName = `Unknown (${item.asset})`;
-        }
+        let marketName = info ? info.question : `Unknown (${item.asset})`;
+        let outcomeName = info ? info.outcome : "Unknown";
 
         return {
             timestamp: new Date(item.timestamp * 1000).toISOString(),
@@ -271,34 +247,22 @@ async function fetchHistory() {
         };
     });
 
-    // 5. Save to File (CSV Format)
+    // 5. Save to File
     const historyDir = path.join(__dirname, 'history');
     if (!fs.existsSync(historyDir)) fs.mkdirSync(historyDir);
     const nowStr = new Date().toISOString().replace(/[:.]/g, '-');
-    const filename = path.join(historyDir, `synth_history_DUAL_${nowStr}.csv`);
+    const filename = path.join(historyDir, `synth_history_FIXED_${nowStr}.csv`);
 
-    // CSV Header
     const header = "timestamp,type,side,market,outcome,size,price,valueUSDC,hash";
-
-    // CSV Rows
     const rows = finalData.map(d => {
-        // Escape quotes in text fields to prevent CSV breakage
         const safeMarket = `"${d.market.replace(/"/g, '""')}"`;
         const safeOutcome = `"${d.outcome.replace(/"/g, '""')}"`;
         return `${d.timestamp},${d.type},${d.side},${safeMarket},${safeOutcome},${d.size},${d.price},${d.value},${d.hash}`;
     });
 
     const csvContent = [header, ...rows].join('\n');
-
     fs.writeFileSync(filename, csvContent);
     console.log(colors.green + `[Done] Saved to ${filename}` + colors.reset);
-
-    // Preview
-    console.log("\n--- LATEST 5 EVENTS ---");
-    finalData.slice(0, 5).forEach(d => {
-        const color = d.side === 'BUY' ? colors.green : (d.side === 'REDEEM' ? colors.yellow : colors.red);
-        console.log(`${d.timestamp} | ${color}${d.side.padEnd(6)}${colors.reset} | ${d.size} sh @ $${d.price} | ${d.market.substring(0, 40)}...`);
-    });
 }
 
 fetchHistory();
