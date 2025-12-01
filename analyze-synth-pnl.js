@@ -3,7 +3,7 @@ const path = require('path');
 
 // --- CONFIGURATION ---
 // Paste the exact market name you want to analyze here:
-const TARGET_MARKET = "Bitcoin Up or Down - November 30, 10:45PM-11:00PM ET";
+const TARGET_MARKET = "Bitcoin Up or Down - December 1, 2:30PM-2:45PM ET";
 
 // ANSI Colors
 const colors = {
