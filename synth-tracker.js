@@ -172,21 +172,78 @@ class ShadowPortfolio {
         this.execute(tokenId, diff, currentMarketPrice, shadow.market);
     }
 
-    async execute(tokenId, sizeToFill, executionPrice, market) {
+    forceSync(tokenId, actualNetShares, marketInfo) {
+        if (!this.positions.has(tokenId)) {
+            this.positions.set(tokenId, {
+                netShares: actualNetShares,
+                totalCost: 0, // We lose cost basis tracking on sync, but position accuracy is more important
+                avgEntry: 0,
+                market: marketInfo
+            });
+        } else {
+            const pos = this.positions.get(tokenId);
+            pos.netShares = actualNetShares; // <--- CRITICAL: Overwrite memory with API reality
+        }
+    }
+
+    async executeAggr(tokenId, sizeToFill, basePrice, market) {
+        let attempt = 0;
+        const maxRetries = 3; // Don't loop forever
+        let currentPrice = basePrice;
+
+        while (attempt < maxRetries) {
+            attempt++;
+
+            // Dynamic Slippage: Increase aggression on every fail
+            // Attempt 1: 2% buffer
+            // Attempt 2: 5% buffer
+            // Attempt 3: 10% buffer
+            const aggression = [0.02, 0.05, 0.10];
+            const buffer = aggression[attempt - 1] || 0.05;
+
+            // Calculate Limit
+            let limitPrice = sizeToFill > 0
+                ? currentPrice * (1 + buffer)
+                : currentPrice * (1 - buffer);
+
+            // Clamp
+            limitPrice = Math.min(Math.max(limitPrice, 0.02), 0.99);
+
+            console.log(colors.yellow + `[Attempt ${attempt}] Executing ${sizeToFill} @ limit $${limitPrice.toFixed(3)}` + colors.reset);
+
+            const success = await placeOrder(tokenId, limitPrice, sizeToFill, sizeToFill > 0 ? Side.BUY : Side.SELL, market);
+
+            if (success) {
+                return true; // We are done
+            }
+
+            // If we failed, it's likely because price moved away. 
+            // We need to fetch the NEW price to re-anchor our next bid.
+            // Quickest way is to just assume we need to step up our bid.
+            // Or, do a quick JIT price check (adds latency but ensures accuracy).
+        }
+        console.log(colors.red + `[GAVE UP] Failed to fill after ${maxRetries} attempts.` + colors.reset);
+    }
+
+    async execute(tokenId, sizeToFill, basePrice, market) {
         pendingOrders.add(tokenId);
 
+        // --- 1. PRE-FLIGHT SAFETY CHECKS (From your old code) ---
         const side = sizeToFill > 0 ? Side.BUY : Side.SELL;
         let finalSize = Math.abs(sizeToFill);
 
         // Wallet Balance Check
         if (side === Side.BUY) {
-            const estimatedCost = finalSize * executionPrice;
+            // Use basePrice for estimation (it will be close enough)
+            const estimatedCost = finalSize * basePrice;
             if (estimatedCost > userCollateral) {
                 console.log(colors.yellow + `[ADJUST] Target cost $${estimatedCost.toFixed(2)} exceeds wallet balance $${userCollateral.toFixed(2)}.` + colors.reset);
-                let affordableSize = (userCollateral * 0.99) / executionPrice;
+                // Calculate max affordable size with a tiny buffer for price moves
+                let affordableSize = (userCollateral * 0.95) / basePrice;
                 affordableSize = Math.floor(affordableSize * 100) / 100;
+
                 if (affordableSize < 1) {
-                    console.log(colors.red + `[SKIP] Funds low.` + colors.reset);
+                    console.log(colors.red + `[SKIP] Funds low (Can afford ${affordableSize}).` + colors.reset);
                     pendingOrders.delete(tokenId);
                     return;
                 }
@@ -207,49 +264,53 @@ class ShadowPortfolio {
             }
         }
 
-        // [LOGIC UPDATE] If 'executionPrice' is passed as a specific Limit (e.g. from Reconcile), use it.
-        // Otherwise (if it's from a trade event), calculate the 5% buffer.
+        // --- 2. THE CHASER LOOP (From the new code) ---
+        let attempt = 0;
+        const maxRetries = 3;
 
-        // Heuristic: If executionPrice is < 0.99, treat it as the Base Price and add buffer.
-        // BUT, if reconcile passed a calculated limit, we might double-buffer.
-        // Since Reconcile passes "SynthPrice * 1.05", we should use that DIRECTLY.
+        // Define aggression levels (2%, 5%, 10%)
+        const aggression = [0.02, 0.05, 0.10];
 
-        // Let's just use the buffer logic for consistency, but ensure reconcile passes base price.
-        // ACTUALLY: simpler way ->
+        while (attempt < maxRetries) {
+            attempt++;
+            const buffer = aggression[attempt - 1] || 0.10;
 
-        const slippagePct = 0.05;
-        const dynamicBuffer = Math.max(executionPrice * slippagePct, 0.04);
+            // Calculate Limit Price based on side
+            // If BUY: Price + Buffer. If SELL: Price - Buffer.
+            let limitPrice = side === Side.BUY
+                ? basePrice * (1 + buffer)
+                : basePrice * (1 - buffer);
 
-        // If selling, price 0 means "Market Sell" (0.02 limit).
-        // If buying, add buffer.
-        let limitPrice = sizeToFill > 0 ? (executionPrice + dynamicBuffer) : (executionPrice - dynamicBuffer);
-        limitPrice = Math.min(Math.max(limitPrice, 0.02), 0.98);
+            // Hard Clamp (0.02 to 0.98)
+            limitPrice = Math.min(Math.max(limitPrice, 0.02), 0.98);
 
-        try {
-            // [CHANGE] Capture the success boolean from placeOrder
+            console.log(colors.yellow + `[Attempt ${attempt}/${maxRetries}] Executing ${side === Side.BUY ? "BUY" : "SELL"} ${finalSize} @ $${limitPrice.toFixed(3)}` + colors.reset);
+
+            // Execute
             const success = await placeOrder(tokenId, limitPrice, finalSize, side, market);
 
             if (success) {
-                // ONLY update local state if the order actually succeeded
+                // --- 3. POST-FLIGHT STATE UPDATE ---
                 if (side === Side.BUY) {
                     userCollateral -= (finalSize * limitPrice);
                 }
 
-                // Update Position Tracking
                 const currentPos = myOnChainPositions.get(tokenId) || 0;
                 const newPos = side === Side.BUY ? (currentPos + finalSize) : (currentPos - finalSize);
                 myOnChainPositions.set(tokenId, newPos);
-            } else {
-                // If success is false (order killed), do NOT update state.
-                // The bot will naturally retry in the next loop.
-                console.log(colors.gray + `[FAK Miss] Order killed. Retrying next tick.` + colors.reset);
+
+                // Break the loop, we are done
+                pendingOrders.delete(tokenId);
+                return;
             }
 
-        } catch (e) {
-            // Logs handled in placeOrder
-        } finally {
-            pendingOrders.delete(tokenId);
+            // If we are here, the order failed/killed.
+            // Short pause before retrying prevents API spam limits
+            await new Promise(r => setTimeout(r, 200));
         }
+
+        console.log(colors.red + `[GAVE UP] Failed to fill after ${maxRetries} attempts.` + colors.reset);
+        pendingOrders.delete(tokenId);
     }
 }
 const shadowPortfolio = new ShadowPortfolio();
@@ -594,7 +655,7 @@ async function checkAndRedeem() {
         console.log(colors.yellow + "[Redeem] Signer not ready yet. Skipping." + colors.reset);
         return;
     }
-    
+
     let allPositions = [];
     try {
         const response = await axios.get(`${DATA_API_URL}/positions`, { params: { user: POLYMARKET_PROXY_ADDRESS_LOWER_CASE } });
@@ -631,11 +692,19 @@ async function checkAndRedeem() {
             const tx = await proxyContract.execTransaction(
                 CTF_ADDRESS, 0, innerData, 0, 0, 0, 0,
                 ethers.constants.AddressZero, ethers.constants.AddressZero, signature,
-                { gasLimit: 500000, maxPriorityFeePerGas: ethers.utils.parseUnits('35', 'gwei'), maxFeePerGas: ethers.utils.parseUnits('300', 'gwei') }
+                {
+                    gasLimit: 500000,
+                    maxPriorityFeePerGas: ethers.utils.parseUnits('35', 'gwei'),
+                    maxFeePerGas: ethers.utils.parseUnits('300', 'gwei')
+                }
             );
+
+            console.log(colors.cyan + `[Redeem] Tx Sent. Waiting...` + colors.reset);
             await tx.wait();
             console.log(colors.cyan + `[Redeem] Success. Capital recycled.` + colors.reset);
-        } catch (e) { }
+        } catch (e) {
+            console.error(colors.red + `[Redeem Failed] ${e.message}` + colors.reset);
+        }
     }
 }
 
@@ -697,7 +766,7 @@ async function reconcileShadowPortfolio() {
 
             // Threshold check
             if (Math.abs(delta) > EXECUTION_THRESHOLD) {
-
+                shadowPortfolio.forceSync(tokenId, synthRealSize, market);
                 // [CRITICAL] Check if we already have an open Limit order for this token
                 // const openOrders = await clobClient.getOpenOrders({ tokenID: tokenId });
                 // if (openOrders.length > 0) {
