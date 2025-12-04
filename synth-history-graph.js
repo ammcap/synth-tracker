@@ -4,143 +4,121 @@ const path = require('path');
 
 // --- CONFIGURATION ---
 const SYNTH_ADDRESS = '0x557bed924a1bb6f62842c5742d1dc789b8d480d4'.toLowerCase();
-const HOURS_TO_LOOK_BACK = 1; // Kept at 1 hour as requested
+const HOURS_TO_LOOK_BACK = 4;
 const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
 
-// Official Goldsky Orderbook Subgraph (TRADES)
 const ORDERBOOK_URL = 'https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn';
-
-// Official Goldsky Activity Subgraph (REDEMPTIONS)
 const ACTIVITY_URL = 'https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/activity-subgraph/0.0.4/gn';
 
 const colors = {
     reset: '\x1b[0m', green: '\x1b[32m', cyan: '\x1b[36m', yellow: '\x1b[33m', red: '\x1b[31m', gray: '\x1b[90m'
 };
 
-const api = axios.create({ timeout: 20000 });
+const api = axios.create({ timeout: 30000 });
+
+// Generic function to fetch paginated data for a single entity type
+async function fetchStream(url, queryName, fieldPath, variables) {
+    let allItems = [];
+    let lastTimestamp = Math.floor(Date.now() / 1000) + 60;
+    const startTime = lastTimestamp - (HOURS_TO_LOOK_BACK * 60 * 60);
+    let keepFetching = true;
+    const seenIds = new Set();
+
+    console.log(colors.gray + `   ...querying ${queryName}...` + colors.reset);
+
+    const query = `
+    query Get${queryName}($user: String!, $minTime: BigInt!, $maxTime: BigInt!) {
+        ${fieldPath}(
+            where: { ${variables.userField}: $user, timestamp_gte: $minTime, timestamp_lte: $maxTime }
+            orderBy: timestamp, orderDirection: desc, first: 1000
+        ) {
+            ${variables.fields}
+        }
+    }`;
+
+    while (keepFetching) {
+        try {
+            const vars = { user: SYNTH_ADDRESS, minTime: String(startTime), maxTime: String(lastTimestamp) };
+            const response = await api.post(url, { query: query, variables: vars });
+
+            if (response.data.errors) throw new Error(JSON.stringify(response.data.errors));
+
+            const rawData = response.data.data[fieldPath];
+
+            // Print a dot to show aliveness
+            process.stdout.write(colors.gray + '.' + colors.reset);
+
+            if (!rawData || rawData.length === 0) {
+                keepFetching = false;
+            } else {
+                const newItems = rawData.filter(item => !seenIds.has(item.id));
+                newItems.forEach(item => seenIds.add(item.id));
+                allItems = allItems.concat(newItems);
+
+                const minTimeInBatch = Math.min(...rawData.map(i => parseInt(i.timestamp)));
+
+                // CRITICAL FIX: Stop if we hit the time limit OR if we got a partial page
+                if (minTimeInBatch <= startTime || rawData.length < 1000) {
+                    keepFetching = false;
+                } else {
+                    lastTimestamp = minTimeInBatch;
+                }
+
+                // If full page but no new items (stuck on massive block), force step back
+                if (newItems.length === 0 && rawData.length === 1000) {
+                    lastTimestamp = minTimeInBatch - 1;
+                }
+            }
+            await new Promise(r => setTimeout(r, 50));
+        } catch (e) {
+            console.log(colors.red + `\n      [Error ${queryName}] ${e.message}` + colors.reset);
+            keepFetching = false;
+        }
+    }
+    console.log(""); // New line after dots
+    return allItems;
+}
 
 async function fetchHistory() {
     console.log(colors.cyan + `[History] Fetching data for Synth (${HOURS_TO_LOOK_BACK}h lookback)...` + colors.reset);
 
-    const endTime = Math.floor(Date.now() / 1000);
-    const startTime = endTime - (HOURS_TO_LOOK_BACK * 60 * 60);
+    // --- 1. FETCH ALL STREAMS INDEPENDENTLY ---
+    const orderFields = `id transactionHash timestamp maker taker makerAssetId takerAssetId makerAmountFilled takerAmountFilled`;
 
-    // Cache to store Market Info.
-    const marketCache = new Map();
+    // We run these in parallel
+    const [makerOrders, takerOrders, redemptions, splits, merges] = await Promise.all([
+        fetchStream(ORDERBOOK_URL, "MakerOrders", "orderFilledEvents", { userField: "maker", fields: orderFields }),
+        fetchStream(ORDERBOOK_URL, "TakerOrders", "orderFilledEvents", { userField: "taker", fields: orderFields }),
+        fetchStream(ACTIVITY_URL, "Redemptions", "redemptions", { userField: "redeemer", fields: "id timestamp payout condition indexSets" }),
+        fetchStream(ACTIVITY_URL, "Splits", "splits", { userField: "stakeholder", fields: "id timestamp amount condition" }),
+        fetchStream(ACTIVITY_URL, "Merges", "merges", { userField: "stakeholder", fields: "id timestamp amount condition" })
+    ]);
 
-    // --- 1. FETCH TRADES (Orderbook Subgraph) ---
-    async function fetchSubgraphOrders() {
-        console.log(colors.gray + "   ...querying Trades (Orderbook Subgraph)..." + colors.reset);
-        let allOrders = [];
-        let lastTimestamp = endTime;
-        let keepFetching = true;
+    const rawTrades = [...makerOrders, ...takerOrders];
+    // Dedupe trades (in case self-trading caused overlap, though uncommon with separated queries)
+    const uniqueTrades = Array.from(new Map(rawTrades.map(item => [item.id, item])).values());
 
-        const queryTemplate = `
-        query GetOrders($user: String!, $minTime: BigInt!, $maxTime: BigInt!) {
-            maker: orderFilledEvents(
-                where: { maker: $user, timestamp_gte: $minTime, timestamp_lt: $maxTime }
-                orderBy: timestamp, orderDirection: desc, first: 1000
-            ) {
-                id transactionHash timestamp maker taker makerAssetId takerAssetId makerAmountFilled takerAmountFilled
-            }
-            taker: orderFilledEvents(
-                where: { taker: $user, timestamp_gte: $minTime, timestamp_lt: $maxTime }
-                orderBy: timestamp, orderDirection: desc, first: 1000
-            ) {
-                id transactionHash timestamp maker taker makerAssetId takerAssetId makerAmountFilled takerAmountFilled
-            }
-        }`;
+    const totalActivity = redemptions.length + splits.length + merges.length;
 
-        while (keepFetching) {
-            try {
-                const variables = { user: SYNTH_ADDRESS, minTime: String(startTime), maxTime: String(lastTimestamp) };
-                const response = await api.post(ORDERBOOK_URL, { query: queryTemplate, variables });
-
-                if (response.data.errors) throw new Error(JSON.stringify(response.data.errors));
-
-                const data = response.data.data;
-                const batch = [...(data.maker || []), ...(data.taker || [])];
-
-                if (batch.length === 0) {
-                    keepFetching = false;
-                } else {
-                    const uniqueBatch = batch.filter((v, i, a) => a.findIndex(t => t.id === v.id) === i);
-                    allOrders = allOrders.concat(uniqueBatch);
-                    const minBatchTime = Math.min(...uniqueBatch.map(o => parseInt(o.timestamp)));
-                    if (minBatchTime <= startTime || uniqueBatch.length < 10) keepFetching = false;
-                    else lastTimestamp = minBatchTime;
-                }
-            } catch (e) {
-                console.log(colors.red + `      [Trades Error] ${e.message}` + colors.reset);
-                keepFetching = false;
-            }
-        }
-        return allOrders;
-    }
-
-    // --- 2. FETCH REDEMPTIONS (Activity Subgraph) ---
-    async function fetchRedemptions() {
-        console.log(colors.gray + "   ...querying Redemptions (Activity Subgraph)..." + colors.reset);
-        let allRedemptions = [];
-        let lastTimestamp = endTime;
-        let keepFetching = true;
-
-        const queryTemplate = `
-        query GetRedemptions($user: String!, $minTime: BigInt!, $maxTime: BigInt!) {
-            redemptions(
-                where: { redeemer: $user, timestamp_gte: $minTime, timestamp_lt: $maxTime }
-                orderBy: timestamp, orderDirection: desc, first: 1000
-            ) {
-                id timestamp redeemer payout condition indexSets
-            }
-        }`;
-
-        while (keepFetching) {
-            try {
-                const variables = { user: SYNTH_ADDRESS, minTime: String(startTime), maxTime: String(lastTimestamp) };
-                const response = await api.post(ACTIVITY_URL, { query: queryTemplate, variables });
-
-                if (response.data.errors) throw new Error(JSON.stringify(response.data.errors));
-
-                const batch = response.data.data.redemptions || [];
-
-                if (batch.length === 0) {
-                    keepFetching = false;
-                } else {
-                    allRedemptions = allRedemptions.concat(batch);
-                    const minBatchTime = Math.min(...batch.map(o => parseInt(o.timestamp)));
-                    if (minBatchTime <= startTime || batch.length < 100) keepFetching = false;
-                    else lastTimestamp = minBatchTime;
-                }
-            } catch (e) {
-                console.log(colors.red + `      [Redemption Error] ${e.message}` + colors.reset);
-                keepFetching = false;
-            }
-        }
-        return allRedemptions;
-    }
-
-    const [rawTrades, rawRedemptions] = await Promise.all([fetchSubgraphOrders(), fetchRedemptions()]);
-
-    const totalEvents = rawTrades.length + rawRedemptions.length;
-    if (totalEvents === 0) {
-        console.log(colors.red + "[Error] No events found. Check address/time." + colors.reset);
+    if (uniqueTrades.length + totalActivity === 0) {
+        console.log(colors.red + "[Error] No events found." + colors.reset);
         return;
     }
 
-    console.log(colors.green + `[Success] Found ${rawTrades.length} trades and ${rawRedemptions.length} redemptions.` + colors.reset);
+    console.log(colors.green + `[Success] Found ${uniqueTrades.length} trades and ${totalActivity} activity events.` + colors.reset);
 
-    // --- 3. METADATA LOOKUP (Gamma API) ---
+    // --- 2. METADATA LOOKUP ---
     const tokenIdsToFetch = new Set();
     const conditionIdsToFetch = new Set();
+    const marketCache = new Map();
 
-    rawTrades.forEach(o => {
+    uniqueTrades.forEach(o => {
         if (o.makerAssetId) tokenIdsToFetch.add(o.makerAssetId);
         if (o.takerAssetId) tokenIdsToFetch.add(o.takerAssetId);
     });
 
-    rawRedemptions.forEach(r => {
-        if (r.condition) conditionIdsToFetch.add(r.condition);
+    [...redemptions, ...splits, ...merges].forEach(a => {
+        if (a.condition) conditionIdsToFetch.add(a.condition);
     });
 
     const uniqueTokens = Array.from(tokenIdsToFetch).filter(x => x && x !== "0");
@@ -148,45 +126,48 @@ async function fetchHistory() {
 
     console.log(colors.gray + `   ...resolving names for ${uniqueTokens.length} tokens and ${uniqueConditions.length} conditions...` + colors.reset);
 
-    // Helper to fetch markets individually to avoid API chunking errors
     async function fetchMarketMetadata(ids, paramName) {
-        for (let i = 0; i < ids.length; i++) {
-            const id = ids[i];
-            if (i % 5 === 0) process.stdout.write(colors.gray + `.` + colors.reset);
+        for (let i = 0; i < ids.length; i += 20) {
+            const batch = ids.slice(i, i + 20);
+            process.stdout.write(colors.gray + `.` + colors.reset);
             try {
-                // Rate limit
-                await new Promise(r => setTimeout(r, 50));
+                await new Promise(r => setTimeout(r, 100)); // Rate limit buffer
+                const params = {}; params[paramName] = batch.join(','); // Fetch batch
+                // Note: The API might expect single ID or array. 
+                // If Gamma doesn't support comma-separated, we revert to loop 1 by 1. 
+                // Assuming 1 by 1 for safety based on your previous code:
+                for (const id of batch) {
+                    const p = {}; p[paramName] = id;
+                    const resp = await api.get(`${GAMMA_API_URL}/markets`, { params: p });
+                    if (resp.data && Array.isArray(resp.data)) {
+                        resp.data.forEach(m => {
+                            let tokens = JSON.parse(m.clobTokenIds || '[]');
+                            let outcomes = JSON.parse(m.outcomes || '[]');
 
-                // Fetch individually
-                const params = {};
-                params[paramName] = id;
-                const resp = await api.get(`${GAMMA_API_URL}/markets`, { params: params });
+                            // --- THE FIX: FORCE 'UP' TO INDEX 0 ---
+                            // If the API returns ["Down", "Up"], we swap them back to ["Up", "Down"]
+                            // so they match the CTF Slot Order (Long=0, Short=1).
+                            if (outcomes.length === 2 && outcomes[1] === "Up" && outcomes[0] === "Down") {
+                                // console.log(`[Fix] correcting swapped labels for ${m.question}`);
+                                outcomes = ["Up", "Down"];
+                                // We don't swap tokens because clobTokenIds are usually usually correct by slot.
+                                // But if the API swapped both, this aligns the Label to the Slot.
+                            }
+                            // --------------------------------------
 
-                if (resp.data && Array.isArray(resp.data)) {
-                    resp.data.forEach(m => {
-                        const tokens = JSON.parse(m.clobTokenIds || '[]');
-                        const outcomes = JSON.parse(m.outcomes || '[]');
-
-                        // Map by Token ID
-                        tokens.forEach((tokenId, index) => {
-                            marketCache.set(String(tokenId), {
-                                question: m.question,
-                                outcome: outcomes[index] || 'Unknown',
-                                conditionId: m.conditionId,
-                                outcomes: outcomes
+                            tokens.forEach((tokenId, index) => {
+                                marketCache.set(String(tokenId), {
+                                    question: m.question, outcome: outcomes[index] || 'Unknown',
+                                    conditionId: m.conditionId, outcomes: outcomes
+                                });
+                            });
+                            marketCache.set(String(m.conditionId), {
+                                question: m.question, outcomes: outcomes
                             });
                         });
-
-                        // Map by Condition ID (for Redemptions)
-                        marketCache.set(String(m.conditionId), {
-                            question: m.question,
-                            outcomes: outcomes
-                        });
-                    });
+                    }
                 }
-            } catch (e) {
-                console.log(colors.yellow + `\n[Warning] Failed to fetch metadata for ${paramName}=${id}` + colors.reset);
-            }
+            } catch (e) { }
         }
         console.log("");
     }
@@ -194,88 +175,84 @@ async function fetchHistory() {
     await fetchMarketMetadata(uniqueTokens, 'clob_token_ids');
     await fetchMarketMetadata(uniqueConditions, 'condition_ids');
 
-    // --- 4. PROCESS TRADES ---
-    const processedTrades = rawTrades.map(o => {
-        const isMaker = o.maker.toLowerCase() === SYNTH_ADDRESS;
-        let marketName = "Unknown";
-        let outcomeName = "Unknown";
-        let side = "UNKNOWN";
+    // --- 3. PROCESS EVENTS ---
+    let finalData = [];
 
+    // Process Trades
+    uniqueTrades.forEach(o => {
+        const isMaker = o.maker.toLowerCase() === SYNTH_ADDRESS;
         const makerInfo = marketCache.get(String(o.makerAssetId));
         const takerInfo = marketCache.get(String(o.takerAssetId));
+        let marketName = "Unknown", outcomeName = "Unknown", side = "UNKNOWN", size = 0, price = 0, value = 0;
 
-        let outcomeAmount, moneyAmount;
-
-        if (makerInfo) {
-            outcomeAmount = parseFloat(o.makerAmountFilled) / 1e6;
-            moneyAmount = parseFloat(o.takerAmountFilled) / 1e6;
-            marketName = makerInfo.question;
-            outcomeName = makerInfo.outcome;
+        if (makerInfo) { // Selling
+            size = parseFloat(o.makerAmountFilled) / 1e6;
+            value = parseFloat(o.takerAmountFilled) / 1e6;
+            marketName = makerInfo.question; outcomeName = makerInfo.outcome;
             side = isMaker ? "SELL" : "BUY";
-        } else if (takerInfo) {
-            outcomeAmount = parseFloat(o.takerAmountFilled) / 1e6;
-            moneyAmount = parseFloat(o.makerAmountFilled) / 1e6;
-            marketName = takerInfo.question;
-            outcomeName = takerInfo.outcome;
+        } else if (takerInfo) { // Buying
+            size = parseFloat(o.takerAmountFilled) / 1e6;
+            value = parseFloat(o.makerAmountFilled) / 1e6;
+            marketName = takerInfo.question; outcomeName = takerInfo.outcome;
             side = isMaker ? "BUY" : "SELL";
-        } else {
-            // Only return null if we truly can't identify the market
-            return null;
-        }
+        } else return;
 
-        const price = outcomeAmount > 0 ? moneyAmount / outcomeAmount : 0;
-
-        return {
+        price = size > 0 ? value / size : 0;
+        finalData.push({
             timestamp: parseInt(o.timestamp),
-            type: "TRADE",
-            side: side,
-            market: marketName,
-            outcome: outcomeName,
-            size: outcomeAmount,
-            price: price,
-            value: moneyAmount,
-            hash: o.transactionHash
-        };
-    }).filter(x => x !== null);
-
-    // --- 5. PROCESS REDEMPTIONS ---
-    const processedRedemptions = rawRedemptions.map(r => {
-        const marketInfo = marketCache.get(String(r.condition));
-        let marketName = "Unknown";
-        let outcomeName = "Unknown";
-
-        // Split by '_' or '-' to get clean hash from ID (e.g. "0xHash_0xLogIndex")
-        const txHash = r.id.split(/[-_]/)[0];
-
-        const payout = parseFloat(r.payout) / 1e6;
-
-        if (marketInfo && r.indexSets && r.indexSets.length > 0) {
-            marketName = marketInfo.question;
-            const indexSetVal = parseInt(r.indexSets[0]);
-            const outcomeIndex = Math.log2(indexSetVal);
-
-            if (marketInfo.outcomes && marketInfo.outcomes[outcomeIndex]) {
-                outcomeName = marketInfo.outcomes[outcomeIndex];
-            }
-        }
-
-        return {
-            timestamp: parseInt(r.timestamp),
-            type: "REDEEM",
-            side: "REDEEM",
-            market: marketName,
-            outcome: outcomeName,
-            size: payout,
-            price: 1.0,
-            value: payout,
-            hash: txHash
-        };
+            type: "TRADE", side, market: marketName, outcome: outcomeName,
+            size, price, value, hash: o.transactionHash
+        });
     });
 
-    // --- 6. MERGE AND SAVE ---
-    const finalData = [...processedTrades, ...processedRedemptions];
-    finalData.sort((a, b) => b.timestamp - a.timestamp);
+    // Helper for Activity
+    const processActivity = (items, type, sideLogic) => {
+        items.forEach(a => {
+            const marketInfo = marketCache.get(String(a.condition));
+            const marketName = marketInfo ? marketInfo.question : "Unknown";
+            const txHash = a.id.split(/[-_]/)[0];
 
+            // Special handling for Redemptions
+            if (type === "REDEEM") {
+                let outcomeName = "Unknown";
+                const payout = parseFloat(a.payout) / 1e6;
+                if (marketInfo && a.indexSets && a.indexSets.length > 0) {
+                    const idx = Math.log2(parseInt(a.indexSets[0]));
+                    if (marketInfo.outcomes[idx]) outcomeName = marketInfo.outcomes[idx];
+                }
+                finalData.push({
+                    timestamp: parseInt(a.timestamp),
+                    type: "REDEEM", side: "REDEEM", market: marketName, outcome: outcomeName,
+                    size: payout, price: 1.0, value: payout, hash: txHash
+                });
+            } else {
+                // Splits (MINT) and Merges (BURN)
+                const amount = parseFloat(a.amount) / 1e6;
+                if (marketInfo && marketInfo.outcomes) {
+                    marketInfo.outcomes.forEach(outcome => {
+                        finalData.push({
+                            timestamp: parseInt(a.timestamp),
+                            type: type,
+                            side: sideLogic, // BUY for Split, SELL for Merge
+                            market: marketName,
+                            outcome: outcome,
+                            size: amount,
+                            price: 0.50,
+                            value: amount / marketInfo.outcomes.length,
+                            hash: txHash
+                        });
+                    });
+                }
+            }
+        });
+    };
+
+    processActivity(redemptions, "REDEEM", "REDEEM");
+    processActivity(splits, "SPLIT", "BUY");
+    processActivity(merges, "MERGE", "SELL");
+
+    // Sort and Save
+    finalData.sort((a, b) => b.timestamp - a.timestamp);
     const historyDir = path.join(__dirname, 'history');
     if (!fs.existsSync(historyDir)) fs.mkdirSync(historyDir);
     const nowStr = new Date().toISOString().replace(/[:.]/g, '-');
@@ -289,8 +266,7 @@ async function fetchHistory() {
         return `${timeStr},${d.type},${d.side},${safeMarket},${safeOutcome},${d.size.toFixed(2)},${d.price.toFixed(3)},${d.value.toFixed(2)},${d.hash}`;
     });
 
-    const csvContent = [header, ...rows].join('\n');
-    fs.writeFileSync(filename, csvContent);
+    fs.writeFileSync(filename, [header, ...rows].join('\n'));
     console.log(colors.green + `[Done] Saved ${finalData.length} rows to ${filename}` + colors.reset);
 }
 
