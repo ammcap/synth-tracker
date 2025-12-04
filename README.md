@@ -4,8 +4,7 @@ A script designed to track Synth's — Bittensor Subnet 50 (SN50) — proxy wall
 
 ## TODOS (small lifts)
 
-- merge proper TRADE (buys and sells) history from `synth-history-graph.js` with proper REDEEM history from `synth-history.js`
-- update `analyze-trades.js` to use new output
+- keep refining `synth-history-graph.js` and `analyze-market.js` to get as close to the real thing as possible (figure out remaining inventory issue/bug)
 
 ---
 
