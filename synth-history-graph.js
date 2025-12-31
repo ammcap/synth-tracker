@@ -4,7 +4,7 @@ const path = require('path');
 
 // --- CONFIGURATION ---
 const SYNTH_ADDRESS = '0x557bed924a1bb6f62842c5742d1dc789b8d480d4'.toLowerCase();
-const HOURS_TO_LOOK_BACK = 168;
+const HOURS_TO_LOOK_BACK = 720;
 const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
 
 const ORDERBOOK_URL = 'https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn';
